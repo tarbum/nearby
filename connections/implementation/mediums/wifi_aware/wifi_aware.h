@@ -48,6 +48,16 @@ class WifiAware {
   WifiAware() = default;
   ~WifiAware();
 
+  // Returns the Wi-Fi Aware service name Nearby publishes and subscribes to
+  // for |service_id|. Like the Wi-Fi LAN and AWDL mDNS service types, it is
+  // derived from the service ID the client passed in (see
+  // Utils::GenerateServiceType()), so Nearby Connections never hardcodes a
+  // client specific name; pass the upgrade service ID for bandwidth upgrades.
+  // iOS clients must declare the derived name under WiFiAwareServices in their
+  // Info.plist ahead of time, as they already declare the Wi-Fi LAN and AWDL
+  // service types under NSBonjourServices.
+  static std::string GenerateServiceName(absl::string_view service_id);
+
   // Returns true, if WifiAware communications are supported by a platform.
   bool IsAvailable() const ABSL_LOCKS_EXCLUDED(mutex_);
 
@@ -75,11 +85,15 @@ class WifiAware {
   bool IsDiscovering(const std::string& service_id) ABSL_LOCKS_EXCLUDED(mutex_);
 
   bool IsPublishing() ABSL_LOCKS_EXCLUDED(mutex_);
-  bool StartPublishing() ABSL_LOCKS_EXCLUDED(mutex_);
+  // Publishes |service_name| (see GenerateServiceName()).
+  bool StartPublishing(absl::string_view service_name)
+      ABSL_LOCKS_EXCLUDED(mutex_);
   bool StopPublishing() ABSL_LOCKS_EXCLUDED(mutex_);
 
   bool IsSubscribing() ABSL_LOCKS_EXCLUDED(mutex_);
-  bool StartSubscribing() ABSL_LOCKS_EXCLUDED(mutex_);
+  // Subscribes to |service_name| (see GenerateServiceName()).
+  bool StartSubscribing(absl::string_view service_name)
+      ABSL_LOCKS_EXCLUDED(mutex_);
   bool StopSubscribing() ABSL_LOCKS_EXCLUDED(mutex_);
 
   // See api::WifiAwareMedium::SetExpectedPeerId(). Must be called before
@@ -89,7 +103,7 @@ class WifiAware {
   void SetExpectedPeerId(absl::string_view peer_id) ABSL_LOCKS_EXCLUDED(mutex_);
 
   // Starts a worker thread, creates a WifiAware socket, associates it with a
-  // service id.
+  // service id, and publishes GenerateServiceName(service_id).
   ErrorOr<bool> StartAcceptingConnections(const std::string& service_id,
                                           absl::string_view channel_name,
                                           AcceptedConnectionCallback callback)

@@ -18,10 +18,13 @@
 #include <string>
 #include <utility>
 
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "connections/implementation/bwu_handler.h"
 #include "connections/implementation/endpoint_channel.h"
 #include "connections/implementation/flags/nearby_connections_feature_flags.h"
+#include "connections/implementation/mediums/utils.h"
 #include "connections/implementation/mediums/wifi_aware/wifi_aware_bwu_handler.h"
 #include "connections/implementation/mediums/wifi_aware/wifi_aware_endpoint_channel.h"
 #include "internal/flags/nearby_flags.h"
@@ -36,6 +39,25 @@
 
 namespace nearby {
 namespace connections {
+
+namespace {
+
+// Appended to the service ID before it is hashed, so that a Wi-Fi Aware
+// service name never collides with the Wi-Fi LAN mDNS service type derived
+// from the same service ID (AWDL does the same with "_AWDL").
+constexpr absl::string_view kServiceIdSuffixForServiceName = "_AWARE";
+
+}  // namespace
+
+std::string WifiAware::GenerateServiceName(absl::string_view service_id) {
+  // Wi-Fi Aware service names have the form of an mDNS service type without
+  // the trailing dot ("_<hash>._tcp"); that is what Apple's WiFiAwareServices
+  // Info.plist keys and Android's NAN service names look like.
+  return std::string(
+      absl::StripSuffix(Utils::GenerateServiceType(absl::StrCat(
+                            service_id, kServiceIdSuffixForServiceName)),
+                        "."));
+}
 
 WifiAware::~WifiAware() {
   while (!discovering_info_.empty()) {
@@ -215,7 +237,7 @@ bool WifiAware::IsAcceptingConnectionsLocked(const std::string& service_id) {
 ErrorOr<bool> WifiAware::StartAcceptingConnectionsLocked(
     const std::string& service_id, absl::string_view channel_name,
     AcceptedConnectionCallback callback) {
-  if (medium_.StartPublishing()) {
+  if (medium_.StartPublishing(GenerateServiceName(service_id))) {
     LOG(INFO) << "WifiAware successfully started publishing";
 
     WifiAwareServerSocket server_socket = medium_.ListenForService(0);
@@ -283,9 +305,9 @@ bool WifiAware::IsPublishing() {
   return medium_.IsPublishing();
 }
 
-bool WifiAware::StartPublishing() {
+bool WifiAware::StartPublishing(absl::string_view service_name) {
   MutexLock lock(&mutex_);
-  return medium_.StartPublishing();
+  return medium_.StartPublishing(std::string(service_name));
 }
 
 bool WifiAware::StopPublishing() {
@@ -298,9 +320,9 @@ bool WifiAware::IsSubscribing() {
   return medium_.IsSubscribing();
 }
 
-bool WifiAware::StartSubscribing() {
+bool WifiAware::StartSubscribing(absl::string_view service_name) {
   MutexLock lock(&mutex_);
-  return medium_.StartSubscribing();
+  return medium_.StartSubscribing(std::string(service_name));
 }
 
 bool WifiAware::StopSubscribing() {

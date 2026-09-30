@@ -18,9 +18,14 @@
 #include <cstdint>
 #include <string>
 
+#include "absl/strings/ascii.h"
+#include "absl/strings/escaping.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "internal/platform/base64_utils.h"
 #include "internal/platform/byte_array.h"
 #include "internal/platform/crypto.h" //NOLINT
+#include "internal/platform/nsd_service_info.h"
 #include "internal/platform/prng.h"
 
 namespace nearby {
@@ -66,6 +71,14 @@ std::string Utils::GenerateSalt() { return GenerateSalt(kDefaultSaltLength); }
 std::string Utils::GenerateSalt(size_t length) {
   ByteArray salt = GenerateRandomBytes(length);
   return Base64Utils::Encode(salt);
+}
+
+std::string Utils::GenerateServiceType(absl::string_view service_id) {
+  const ByteArray service_id_hash = Sha256Hash(
+      std::string(service_id), NsdServiceInfo::kTypeFromServiceIdHashLength);
+  return absl::StrFormat(NsdServiceInfo::kNsdTypeFormat,
+                         absl::AsciiStrToUpper(absl::BytesToHexString(
+                             std::string(service_id_hash))));
 }
 
 }  // namespace connections
