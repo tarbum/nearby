@@ -157,6 +157,13 @@ WifiDirectMedium::~WifiDirectMedium() {
 
 bool WifiDirectMedium::IsInterfaceValid() const { return is_interface_valid_; }
 
+bool WifiDirectMedium::IsGOSupported() const {
+  // Refer the explanation at the top of this file.
+  return false;
+}
+
+bool WifiDirectMedium::IsGCSupported() const { return is_interface_valid_; }
+
 // Discoverer connects to server socket
 std::unique_ptr<api::WifiDirectSocket> WifiDirectMedium::ConnectToService(
     absl::string_view ip_address, int port,
