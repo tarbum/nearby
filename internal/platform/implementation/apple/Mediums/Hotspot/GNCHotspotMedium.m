@@ -157,7 +157,14 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
     status = [CLLocationManager authorizationStatus];
   }
 
-  if (status != kCLAuthorizationStatusAuthorizedAlways) {
+#if TARGET_OS_OSX
+  BOOL locationAuthorized = (status == kCLAuthorizationStatusAuthorized ||
+                             status == kCLAuthorizationStatusAuthorizedAlways);
+#else
+  BOOL locationAuthorized = (status == kCLAuthorizationStatusAuthorizedAlways ||
+                             status == kCLAuthorizationStatusAuthorizedWhenInUse);
+#endif
+  if (!locationAuthorized) {
     GNCLoggerError(@"Location access permission is not granted, skipping to connect to Hotspot.");
     return NO;
   }

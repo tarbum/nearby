@@ -14,6 +14,8 @@
 
 #include "connections/implementation/bwu_manager.h"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <cassert>
 #include <memory>
@@ -95,9 +97,14 @@ BwuManager::BwuManager(
   }
   if (config_.allow_upgrade_to.All(false)) {
     config_.allow_upgrade_to.web_rtc = true;
+    // Enable Wi-Fi Direct when the platform actually provides a Group
+    // Client/Owner medium. This lets the macOS Group Client join an
+    // Android-created P2P group without relying on the default-disabled flag.
     if (NearbyFlags::GetInstance().GetBoolFlag(
             config_package_nearby::nearby_connections_feature::
-                kEnableWifiDirect)) {
+                kEnableWifiDirect) ||
+        mediums_->GetWifiDirect().IsGCAvailable() ||
+        mediums_->GetWifiDirect().IsGOAvailable()) {
       config_.allow_upgrade_to.wifi_direct = true;
     }
     if (NearbyFlags::GetInstance().GetBoolFlag(
@@ -117,6 +124,13 @@ BwuManager::BwuManager(
       config_.allow_upgrade_to.awdl = true;
     }
   }
+
+  // Test hook: force the BWU path away from Wi-Fi LAN so Wi-Fi Direct/hotspot
+  // can be exercised on a shared network.
+  if (std::getenv("QUICKSHARE_DISABLE_WIFI_LAN_UPGRADE") != nullptr) {
+    config_.allow_upgrade_to.wifi_lan = false;
+  }
+
   if (!handlers.empty()) {
     handlers_ = std::move(handlers);
   } else {
@@ -141,12 +155,14 @@ void BwuManager::InitBwuHandlers() {
                           &BwuManager::OnIncomingConnection, this)));
   }
   if (config_.allow_upgrade_to.wifi_hotspot) {
+    LOG(INFO) << "BwuManager: WIFI_HOTSPOT handler enabled";
     handlers_.emplace(
         Medium::WIFI_HOTSPOT,
         mediums_->GetWifiHotspot().CreateBwuHandler(
             absl::bind_front(&BwuManager::OnIncomingConnection, this)));
   }
   if (config_.allow_upgrade_to.wifi_direct) {
+    LOG(INFO) << "BwuManager: WIFI_DIRECT handler enabled";
     handlers_.emplace(
         Medium::WIFI_DIRECT,
         mediums_->GetWifiDirect().CreateBwuHandler(
@@ -1740,6 +1756,10 @@ bool BwuManager::NeedToSwitchRole(
     switch (medium) {
       case Medium::WIFI_HOTSPOT:
         return medium_role.support_wifi_hotspot_host();
+      case Medium::WIFI_DIRECT:
+        // macOS cannot be the Group Owner. Ask an Android peer that can host
+        // the group to take the GO role so we can join as the Group Client.
+        return medium_role.support_wifi_direct_group_owner();
       case Medium::WIFI_AWARE:
       case Medium::WIFI_AWARE_R4: {
         // Apple can only take the Wi-Fi Aware R4 subscriber role: its publisher

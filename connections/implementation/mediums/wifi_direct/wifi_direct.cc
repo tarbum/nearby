@@ -66,8 +66,14 @@ bool WifiDirect::IsGOAvailable() const {
 }
 
 bool WifiDirect::IsGOAvailableLocked() const {
+#if defined(__APPLE__)
+  // Apple platforms can join a Wi-Fi Direct group as a Group Client but cannot
+  // create/host a Group Owner.
+  return false;
+#else
   if (medium_.IsValid()) return medium_.IsInterfaceValid();
   return false;
+#endif
 }
 
 bool WifiDirect::IsGCAvailable() const {

@@ -319,12 +319,10 @@ let package = Package(
         "third_party",
         // non-Apple mediums
         "connections/implementation/mediums/awdl/awdl_stub.cc",
+        "connections/implementation/mediums/wifi_direct/wifi_direct_stub.cc",
         "connections/implementation/mediums/bluetooth/bluetooth_bwu_handler.cc",
         "connections/implementation/mediums/bluetooth/bluetooth_classic.cc",
         "connections/implementation/mediums/bluetooth/bluetooth_endpoint_channel.cc",
-        "connections/implementation/mediums/wifi_direct/wifi_direct.cc",
-        "connections/implementation/mediums/wifi_direct/wifi_direct_bwu_handler.cc",
-        "connections/implementation/mediums/wifi_direct/wifi_direct_endpoint_channel.cc",
         // build files
         "connections/implementation/analytics/BUILD",
         "connections/implementation/flags/BUILD",

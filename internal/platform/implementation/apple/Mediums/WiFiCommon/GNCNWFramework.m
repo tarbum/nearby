@@ -81,8 +81,11 @@ static BOOL GNCExtractServiceFromBrowseResult(
     nw_browse_result_t browseResult, NSString *_Nullable *_Nonnull outName,
     NSDictionary<NSString *, NSString *> *_Nullable *_Nonnull outTxtRecords) {
   // If the service has a loopback interface, we probably discovered our own advertisement, so we
-  // ignore it.
-  if (GNCHasLoopbackInterface(browseResult)) {
+  // ignore it. QUICKSHARE_ALLOW_LOOPBACK is a local test hook that lets two
+  // instances on the same Mac exercise the protocol.
+  BOOL allowLoopback =
+      [[[NSProcessInfo processInfo] environment] objectForKey:@"QUICKSHARE_ALLOW_LOOPBACK"] != nil;
+  if (GNCHasLoopbackInterface(browseResult) && !allowLoopback) {
     GNCLoggerInfo(@"Ignoring a service event with loopback interface.");
     return NO;
   }

@@ -41,6 +41,7 @@
 #import "internal/platform/implementation/apple/utils.h"
 #include "internal/platform/implementation/apple/wifi.h"
 #include "internal/platform/implementation/apple/wifi_aware.h"
+#include "internal/platform/implementation/apple/wifi_direct.h"
 #include "internal/platform/implementation/apple/wifi_hotspot.h"
 #include "internal/platform/implementation/apple/wifi_lan.h"
 #include "internal/platform/implementation/mutex.h"
@@ -209,7 +210,10 @@ std::unique_ptr<AwdlMedium> ImplementationPlatform::CreateAwdlMedium() {
 }
 
 std::unique_ptr<WifiHotspotMedium> ImplementationPlatform::CreateWifiHotspotMedium() {
-#if TARGET_OS_IOS
+  // macOS can join an existing SoftAP (Android/iPhone hotspot) even though it
+  // cannot host one. Enable the client-side medium so Nearby Connections can
+  // accept a WifiHotspot bandwidth-upgrade from the Android side.
+#if TARGET_OS_IOS || TARGET_OS_OSX
   return std::make_unique<apple::WifiHotspotMedium>();
 #else
   return nullptr;
@@ -217,7 +221,13 @@ std::unique_ptr<WifiHotspotMedium> ImplementationPlatform::CreateWifiHotspotMedi
 }
 
 std::unique_ptr<WifiDirectMedium> ImplementationPlatform::CreateWifiDirectMedium() {
+#if TARGET_OS_OSX
+  // macOS can join an Android-created Wi-Fi Direct group as a Group Client,
+  // but cannot host a Group Owner.
+  return std::make_unique<apple::WifiDirectMedium>();
+#else
   return nullptr;
+#endif
 }
 
 std::unique_ptr<AppLifecycleMonitor> ImplementationPlatform::CreateAppLifecycleMonitor(
