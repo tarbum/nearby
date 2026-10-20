@@ -456,14 +456,24 @@ BooleanMediumSelector BasePcpHandler::ComputeIntersectionOfSupportedMediums(
                                    static_cast<WifiDirectAuthType>(auth_type)));
                          });
         bool found_common_auth_type = false;
+        // GMS builds may leave supported_wifi_direct_auth_types empty
+        // (observed on Samsung Quick Share) even though they support
+        // Wi-Fi Direct upgrades. Treat an empty list as uninformative and
+        // fall back to the local types; the upgrade path request fails
+        // gracefully if the peer cannot honor them.
+        if (remote_supported_wifi_direct_auth_types.empty()) {
+          LOG(INFO) << "Remote supported no WifiDirect auth types, falling "
+                       "back to local types.";
+        }
         for (const auto& auth_type : local_supported_wifi_direct_auth_types) {
           if (auth_type == WifiDirectAuthType::WIFI_DIRECT_TYPE_UNKNOWN) {
             continue;
           }
-          if (std::find(remote_supported_wifi_direct_auth_types.begin(),
+          if (remote_supported_wifi_direct_auth_types.empty() ||
+              std::find(remote_supported_wifi_direct_auth_types.begin(),
                         remote_supported_wifi_direct_auth_types.end(),
                         auth_type) !=
-              remote_supported_wifi_direct_auth_types.end()) {
+                  remote_supported_wifi_direct_auth_types.end()) {
             LOG(INFO) << "Found common WifiDirect auth type: "
                       << WifiDirectAuthType_Name(auth_type);
             mediums_->GetWifiDirect().SetPreferredWifiDirectAuthType(auth_type);
