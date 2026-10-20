@@ -1755,6 +1755,13 @@ bool BwuManager::NeedToSwitchRole(
   if (GetLocalOsInfo(client).type() == OsInfo::APPLE) {
     switch (medium) {
       case Medium::WIFI_HOTSPOT:
+        // See the WIFI_DIRECT case: GMS may advertise an all-zero
+        // MediumRole even though it can host a hotspot. For Android peers,
+        // optimistically accept the role switch; the upgrade fails
+        // gracefully if the peer cannot host.
+        if (remote_os_info.type() == OsInfo::ANDROID) {
+          return true;
+        }
         return medium_role.support_wifi_hotspot_host();
       case Medium::WIFI_DIRECT:
         // macOS cannot be the Group Owner. Ask an Android peer that can host
