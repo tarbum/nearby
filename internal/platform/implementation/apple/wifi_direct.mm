@@ -195,15 +195,29 @@ std::unique_ptr<api::WifiDirectSocket> WifiDirectMedium::ConnectToService(
     return nullptr;
   }
 
-  GNCNWFrameworkSocket* socket = [medium_ connectToHost:host
-                                                   port:port
-                                           cancelSource:nullptr
-                                                  error:&error];
-  if (socket == nil) {
-    if (error != nil) {
-      GNCLoggerError(@"Error connecting to Wi-Fi Direct host %@:%d: %@", host,
-                     port, error);
+  // DHCP can assign the interface address slightly before the route to the
+  // Group Owner's gateway is installed; retry the dial to absorb that gap
+  // instead of failing the whole upgrade.
+  GNCNWFrameworkSocket* socket = nil;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (attempt > 0) {
+      [NSThread sleepForTimeInterval:1.0];
     }
+    error = nil;
+    socket = [medium_ connectToHost:host
+                               port:port
+                       cancelSource:nullptr
+                              error:&error];
+    if (socket != nil) {
+      break;
+    }
+    if (error != nil) {
+      GNCLoggerError(@"Error connecting to Wi-Fi Direct host %@:%d (attempt "
+                     "%d): %@",
+                     host, port, attempt, error);
+    }
+  }
+  if (socket == nil) {
     return nullptr;
   }
   return std::make_unique<WifiDirectSocket>(socket);
