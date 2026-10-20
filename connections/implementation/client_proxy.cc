@@ -1555,6 +1555,12 @@ location::nearby::connections::MediumRole ClientProxy::GetLocalMediumRole(
     // Apple always supports wifi hotspot client role since they can always
     // join a hotspot.
     medium_role.set_support_wifi_hotspot_client(true);
+    // Apple cannot create a Wi-Fi Direct group (no Group Owner API on macOS),
+    // but it can join a group created by an Android peer as the Group Client.
+    // Advertising this lets the peer's CanHost() check hand us the GO role for
+    // a Wi-Fi Direct bandwidth upgrade.
+    medium_role.set_support_wifi_direct_group_client(
+        mediums_availability.is_wifi_direct_gc_available);
     // Apple supports the Wi-Fi Aware R4 subscriber role only; it never takes
     // the publisher role (see BwuManager::NeedToSwitchRole). Advertising this
     // lets the peer's CanHost() check decide on the right capability instead of
