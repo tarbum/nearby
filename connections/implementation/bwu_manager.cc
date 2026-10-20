@@ -1759,6 +1759,14 @@ bool BwuManager::NeedToSwitchRole(
       case Medium::WIFI_DIRECT:
         // macOS cannot be the Group Owner. Ask an Android peer that can host
         // the group to take the GO role so we can join as the Group Client.
+        // GMS builds may advertise an all-zero MediumRole even though they
+        // can host a Wi-Fi Direct group (Quick Share uses Wi-Fi Direct for
+        // phone-to-phone transfers), so for Android peers don't rely on the
+        // advertised GO bit; an unsupported request fails gracefully and the
+        // remaining mediums are retried.
+        if (remote_os_info.type() == OsInfo::ANDROID) {
+          return true;
+        }
         return medium_role.support_wifi_direct_group_owner();
       case Medium::WIFI_AWARE:
       case Medium::WIFI_AWARE_R4: {
