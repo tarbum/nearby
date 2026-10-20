@@ -180,13 +180,21 @@ std::unique_ptr<api::WifiDirectSocket> WifiDirectMedium::ConnectToService(
     absl::string_view ip_address, int port,
     CancellationFlag* cancellation_flag) {
   NSError* error = nil;
-  if (ip_address.size() != 4) {
-    GNCLoggerError(@"Invalid Wi-Fi Direct IPv4 address size: %zu",
-                   ip_address.size());
-    return nullptr;
+  NSData* host_ip_address = nil;
+  if (ip_address.size() == 4) {
+    host_ip_address = [NSData dataWithBytes:ip_address.data() length:4];
+  } else {
+    // The gateway arrives as a dotted-quad string in the credentials frame
+    // (e.g. "192.168.49.1"); parse it instead of expecting raw bytes.
+    std::string gateway(ip_address);
+    in_addr parsed{};
+    if (inet_pton(AF_INET, gateway.c_str(), &parsed) != 1) {
+      GNCLoggerError(@"Invalid Wi-Fi Direct gateway address: %.*s",
+                     static_cast<int>(ip_address.size()), ip_address.data());
+      return nullptr;
+    }
+    host_ip_address = [NSData dataWithBytes:&parsed length:4];
   }
-  NSData* host_ip_address = [NSData dataWithBytes:ip_address.data()
-                                           length:ip_address.size()];
   GNCIPv4Address* host = [GNCIPv4Address addressFromData:host_ip_address];
   GNCLoggerInfo(@"Connect to Wi-Fi Direct host: %@ port %d",
                 [host dottedRepresentation], port);
