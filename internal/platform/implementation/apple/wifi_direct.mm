@@ -14,8 +14,12 @@
 
 #include "internal/platform/implementation/apple/wifi_direct.h"
 
+#import <CoreWLAN/CoreWLAN.h>
 #import <Foundation/Foundation.h>
 
+#include <arpa/inet.h>
+#include <chrono>
+#include <ifaddrs.h>
 #include <memory>
 #include <string>
 
@@ -31,7 +35,55 @@ namespace nearby {
 namespace apple {
 namespace {
 constexpr char kWifiDirectQueueLabel[] = "com.google.nearby.wifi_direct";
+
+// Returns the first IPv4 address assigned to the Wi-Fi interface, or the
+// empty string if none is assigned.
+std::string CurrentWifiIPv4() {
+  NSString *interface_name = CWWiFiClient.sharedWiFiClient.interface.interfaceName;
+  if (interface_name.length == 0) {
+    return "";
+  }
+  std::string result;
+  ifaddrs *interfaces = nullptr;
+  if (getifaddrs(&interfaces) != 0) {
+    return result;
+  }
+  for (ifaddrs *entry = interfaces; entry != nullptr; entry = entry->ifa_next) {
+    if (entry->ifa_addr == nullptr ||
+        entry->ifa_addr->sa_family != AF_INET ||
+        std::string(entry->ifa_name) != interface_name.UTF8String) {
+      continue;
+    }
+    char address[INET_ADDRSTRLEN] = {0};
+    auto *sockaddr_v4 = reinterpret_cast<sockaddr_in *>(entry->ifa_addr);
+    if (inet_ntop(AF_INET, &sockaddr_v4->sin_addr, address, sizeof(address)) !=
+        nullptr) {
+      result = address;
+      break;
+    }
+  }
+  freeifaddrs(interfaces);
+  return result;
 }
+
+// Waits until the Wi-Fi interface acquires an IPv4 lease different from
+// `pre_join_ip` (the address held before associating with the group) so that
+// callers can immediately dial the group owner's gateway.
+void WaitForIpv4Lease(const std::string &pre_join_ip) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::string ip = CurrentWifiIPv4();
+    if (!ip.empty() && ip != pre_join_ip) {
+      GNCLoggerInfo(@"Wi-Fi Direct interface lease acquired: %s", ip.c_str());
+      return;
+    }
+    [NSThread sleepForTimeInterval:0.25];
+  }
+  GNCLoggerWarning(@"Timed out waiting for a Wi-Fi Direct interface lease; "
+                   "continuing with pre-join address %s",
+                   pre_join_ip.c_str());
+}
+}  // namespace
 
 WifiDirectInputStream::WifiDirectInputStream(GNCNWFrameworkSocket* socket)
     : socket_(socket) {}
@@ -102,11 +154,17 @@ bool WifiDirectMedium::ConnectWifiDirect(
   NSString* ns_password = [[NSString alloc] initWithUTF8String:password.c_str()];
   GNCLoggerInfo(@"ConnectWifiDirect SSID: %@ Password: %s", ns_ssid,
                 masker::Mask(password).c_str());
+  std::string pre_join_ip = CurrentWifiIPv4();
   if (![medium_ connectToWifiNetworkWithSSID:ns_ssid password:ns_password]) {
     GNCLoggerError(@"Failed to join Wi-Fi Direct group %@", ns_ssid);
     return false;
   }
   connected_ssid_ = ns_ssid;
+  // The BWU handler dials the Group Owner's gateway immediately after this
+  // returns. Association alone doesn't guarantee connectivity; wait for DHCP
+  // to assign the group address (e.g. 192.168.49.x) or the first socket
+  // connect fails with no route.
+  WaitForIpv4Lease(pre_join_ip);
   return true;
 }
 
