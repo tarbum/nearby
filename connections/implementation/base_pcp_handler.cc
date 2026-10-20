@@ -1317,7 +1317,13 @@ void BasePcpHandler::StripOutUnavailableMediums(
     allowed.wifi_hotspot = mediums_->GetWifiHotspot().IsAPAvailable();
   }
   if (allowed.wifi_direct) {
-    allowed.wifi_direct = mediums_->GetWifiDirect().IsGOAvailable();
+    // macOS cannot host a Wi-Fi Direct group, but it can join one created by
+    // the peer as a Group Client. Keep the medium advertised when the Group
+    // Client role is available so the peer can propose a Wi-Fi Direct
+    // bandwidth upgrade (mirrors StripOutUnavailableMediums(DiscoveryOptions&)
+    // below).
+    allowed.wifi_direct = mediums_->GetWifi().IsAvailable() &&
+                          mediums_->GetWifiDirect().IsGCAvailable();
   }
   if (allowed.awdl) {
     allowed.awdl = mediums_->GetAwdl().IsAvailable();
