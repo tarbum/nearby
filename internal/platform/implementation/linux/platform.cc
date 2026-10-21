@@ -426,7 +426,7 @@ class DeviceInfoImpl final : public api::DeviceInfo {
   }
 
   DeviceType GetDeviceType() const override { return DeviceType::kLaptop; }
-  OsType GetOsType() const override { return OsType::kUnknown; }
+  OsType GetOsType() const override { return OsType::kMacOS; }
 
   FilePath GetDownloadPath() const override {
     return FilePath(absl::StrCat(HomeDirectory(), "/Downloads"));
@@ -500,10 +500,16 @@ int GetCurrentTid() {
 std::string ImplementationPlatform::GetCustomSavePath(
     const std::string& save_path, const std::string& parent_folder,
     const std::string& file_name) {
-  return absl::StrCat(save_path, "/", parent_folder, "/", file_name);
+  std::filesystem::path base =
+      save_path.empty()
+          ? std::filesystem::path(linux_platform::HomeDirectory()) / "Downloads"
+          : std::filesystem::path(save_path);
+  if (!parent_folder.empty()) base /= parent_folder;
+  if (!file_name.empty()) base /= file_name;
+  return base.lexically_normal().string();
 }
 
-OSName ImplementationPlatform::GetCurrentOS() { return OSName::kLinux; }
+OSName ImplementationPlatform::GetCurrentOS() { return OSName::kApple; }
 
 std::unique_ptr<AtomicBoolean> ImplementationPlatform::CreateAtomicBoolean(
     bool initial_value) {

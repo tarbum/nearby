@@ -646,17 +646,18 @@ void NcAcceptConnection(NC_INSTANCE instance, int endpoint_id,
               const_cast<char*>(bytes.data());
           nc_payload.content.bytes.content.size = bytes.size();
         } else if (nc_payload.type == NC_PAYLOAD_TYPE_FILE) {
+          const std::string file_name = payload.GetFileName();
+          const std::string parent_folder = payload.GetParentFolder();
+          const std::string local_path =
+              payload.AsFile() != nullptr ? payload.AsFile()->GetFilePath()
+                                          : std::string();
           nc_payload.content.file.file_name =
-              (char*)payload.GetFileName().c_str();
+              const_cast<char*>(file_name.c_str());
           nc_payload.content.file.parent_folder =
-              (char*)payload.GetParentFolder().c_str();
+              const_cast<char*>(parent_folder.c_str());
           nc_payload.content.file.offset = payload.GetOffset();
-          if (payload.AsFile() != nullptr) {
-            nc_payload.content.file.local_path =
-                (char*)payload.AsFile()->GetFilePath().c_str();
-          } else {
-            nc_payload.content.file.local_path = nullptr;
-          }
+          nc_payload.content.file.local_path =
+              local_path.empty() ? nullptr : const_cast<char*>(local_path.c_str());
         } else if (nc_payload.type == NC_PAYLOAD_TYPE_STREAM) {
           // TODO(guogang): support stream later.
         }
