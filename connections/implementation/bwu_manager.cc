@@ -67,6 +67,19 @@ using ::location::nearby::proto::connections::DisconnectionReason;
 using ::location::nearby::proto::connections::OperationResultCode;
 using ::nearby::analytics::AnalyticsRecorder;
 
+bool IsUpgradeDisabledByEnv(Medium medium) {
+  switch (medium) {
+    case Medium::WIFI_LAN:
+      return std::getenv("QUICKSHARE_DISABLE_WIFI_LAN_UPGRADE") != nullptr;
+    case Medium::WIFI_DIRECT:
+      return std::getenv("QUICKSHARE_DISABLE_WIFI_DIRECT_UPGRADE") != nullptr;
+    case Medium::WIFI_HOTSPOT:
+      return std::getenv("QUICKSHARE_DISABLE_WIFI_HOTSPOT_UPGRADE") != nullptr;
+    default:
+      return false;
+  }
+}
+
 }  // namespace
 
 BwuManager::BwuManager(
@@ -123,18 +136,6 @@ BwuManager::BwuManager(
             config_package_nearby::nearby_connections_feature::kEnableAwdl)) {
       config_.allow_upgrade_to.awdl = true;
     }
-  }
-
-  // Test hook: force the BWU path away from Wi-Fi LAN so Wi-Fi Direct/hotspot
-  // can be exercised on a shared network.
-  if (std::getenv("QUICKSHARE_DISABLE_WIFI_LAN_UPGRADE") != nullptr) {
-    config_.allow_upgrade_to.wifi_lan = false;
-  }
-  if (std::getenv("QUICKSHARE_DISABLE_WIFI_DIRECT_UPGRADE") != nullptr) {
-    config_.allow_upgrade_to.wifi_direct = false;
-  }
-  if (std::getenv("QUICKSHARE_DISABLE_WIFI_HOTSPOT_UPGRADE") != nullptr) {
-    config_.allow_upgrade_to.wifi_hotspot = false;
   }
 
   if (!handlers.empty()) {
@@ -282,6 +283,13 @@ void BwuManager::InitiateBwuForEndpoint(ClientProxy* client,
              "WIFI_HOTSPOT. Don't do the BWU because STA connecting to "
              "WIFI_HOTSPOT will destroy WIFI_LAN or WIFI_AWARE which will lead "
              "BWU fail and other endpoint connection fail";
+      return;
+    }
+
+    if (IsUpgradeDisabledByEnv(proposed_medium)) {
+      LOG(INFO) << "BwuManager skipping disabled upgrade medium "
+                << location::nearby::proto::connections::Medium_Name(
+                       proposed_medium);
       return;
     }
 
@@ -849,6 +857,14 @@ void BwuManager::ProcessBwuPathAvailableEvent(
             << " medium "
             << location::nearby::proto::connections::Medium_Name(
                    upgrade_medium);
+
+  if (IsUpgradeDisabledByEnv(upgrade_medium)) {
+    LOG(INFO) << "BwuManager rejecting disabled upgrade medium "
+              << location::nearby::proto::connections::Medium_Name(
+                     upgrade_medium);
+    RunUpgradeFailedProtocol(client, endpoint_id, upgrade_path_info);
+    return;
+  }
 
   if ((channel_manager_->isWifiLanConnected() ||
        channel_manager_->isWifiAwareConnected()) &&
@@ -1558,9 +1574,14 @@ std::vector<Medium> BwuManager::StripOutDisallowedUpgradeMediums(
                                [&allowed](Medium medium) {
                                  switch (medium) {
                                    case Medium::WIFI_LAN:
-                                     return !allowed.wifi_lan;
+                                     return !allowed.wifi_lan ||
+                                            IsUpgradeDisabledByEnv(medium);
                                    case Medium::WIFI_HOTSPOT:
-                                     return !allowed.wifi_hotspot;
+                                     return !allowed.wifi_hotspot ||
+                                            IsUpgradeDisabledByEnv(medium);
+                                   case Medium::WIFI_DIRECT:
+                                     return !allowed.wifi_direct ||
+                                            IsUpgradeDisabledByEnv(medium);
                                    default:
                                      // Other mediums are either gated by
                                      // their own flags in the PCP handlers
@@ -1579,6 +1600,7 @@ std::vector<Medium> BwuManager::StripOutUnavailableMediums(
   const bool is_apple = GetLocalOsInfo(client).type() == OsInfo::APPLE;
   std::vector<Medium> available_mediums;
   for (Medium m : mediums) {
+    if (IsUpgradeDisabledByEnv(m)) continue;
     bool available = false;
     if (GetHandlerForMedium(m)) {
       switch (m) {
