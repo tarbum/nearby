@@ -45,6 +45,12 @@ static const UInt8 kMaxRetryCount = 3;
 
 // Timeout for connection attempt.
 static const UInt8 kConnectionTimeoutInSeconds = 2;
+
+// The Group Owner starts beaconing shortly after the credentials frame is
+// received, but macOS scan results can lag, so the scan itself is retried
+// before giving up (up to ~15s total).
+static const UInt8 kMaxScanRetryCount = 8;
+static const NSTimeInterval kScanRetryDelayInSeconds = 1.5;
 #endif  // TARGET_OS_IOS
 
 // An arbitrary timeout that should be pretty lenient.
@@ -157,7 +163,14 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
     status = [CLLocationManager authorizationStatus];
   }
 
-  if (status != kCLAuthorizationStatusAuthorizedAlways) {
+#if TARGET_OS_OSX
+  BOOL locationAuthorized = (status == kCLAuthorizationStatusAuthorized ||
+                             status == kCLAuthorizationStatusAuthorizedAlways);
+#else
+  BOOL locationAuthorized = (status == kCLAuthorizationStatusAuthorizedAlways ||
+                             status == kCLAuthorizationStatusAuthorizedWhenInUse);
+#endif
+  if (!locationAuthorized) {
     GNCLoggerError(@"Location access permission is not granted, skipping to connect to Hotspot.");
     return NO;
   }
@@ -169,21 +182,25 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
   }
 
   NSError *error = nil;
-  NSSet<CWNetwork *> *networks =
-      [wifiInterface scanForNetworksWithSSID:[ssid dataUsingEncoding:NSUTF8StringEncoding]
-                                       error:&error];
-
-  if (!networks) {
-    GNCLoggerError(@"Failed to scan for networks: %@", error);
-    return NO;
-  }
-
   CWNetwork *bestNetwork = nil;
-  for (CWNetwork *network in networks) {
-    if (bestNetwork == nil) {
-      bestNetwork = network;
-    } else {
-      if (network.rssiValue > bestNetwork.rssiValue) {
+  // The Group Owner may not be beaconing yet when the credentials frame
+  // arrives; retry the scan before declaring the network missing.
+  for (int scanAttempt = 0; scanAttempt < kMaxScanRetryCount && !bestNetwork;
+       ++scanAttempt) {
+    if (scanAttempt > 0) {
+      [NSThread sleepForTimeInterval:kScanRetryDelayInSeconds];
+    }
+    NSSet<CWNetwork *> *networks =
+        [wifiInterface scanForNetworksWithSSID:[ssid dataUsingEncoding:NSUTF8StringEncoding]
+                                         error:&error];
+    if (!networks) {
+      GNCLoggerError(@"Failed to scan for networks (attempt %d): %@",
+                     scanAttempt, error);
+      continue;
+    }
+    for (CWNetwork *network in networks) {
+      if (bestNetwork == nil ||
+          network.rssiValue > bestNetwork.rssiValue) {
         bestNetwork = network;
       }
     }

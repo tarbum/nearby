@@ -202,6 +202,17 @@ static NSTimeInterval gKBTCrashLoopMaxTimeBetweenResetting = 15.f;
   }
 #endif
 
+  // On macOS a service add issued while the CBPeripheralManager is still in
+  // CBManagerStateUnknown can be dropped without a didAddService callback,
+  // leaving the service manager stuck in AddInProgress. Reset those entries so
+  // the retry after PoweredOn can add them.
+  for (GNSPeripheralServiceManager *peripheralServiceManager in _peripheralServiceManagers
+           .objectEnumerator) {
+    if (peripheralServiceManager.cbServiceState == GNSBluetoothServiceStateAddInProgress) {
+      [peripheralServiceManager didRemoveCBService];
+    }
+  }
+
   for (GNSPeripheralServiceManager *peripheralServiceManager in _peripheralServiceManagers
            .objectEnumerator) {
     [self addBleServiceForServiceManager:peripheralServiceManager];
