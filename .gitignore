@@ -59,3 +59,5 @@ bazel-*
 linux-build-*.log
 linux-build-*.rc
 linux-verbose.log
+linux-resolve.*
+core
