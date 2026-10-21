@@ -192,11 +192,10 @@ class ConditionVariableImpl final : public api::ConditionVariable {
 
   Exception Wait(absl::Duration timeout) override {
     std::unique_lock<std::mutex> lock(mutex_->GetMutex(), std::adopt_lock);
-    auto result = condition_.wait_for(
+    condition_.wait_for(
         lock, std::chrono::nanoseconds(absl::ToInt64Nanoseconds(timeout)));
     lock.release();
-    return {result == std::cv_status::no_timeout ? Exception::kSuccess
-                                                  : Exception::kTimeout};
+    return {Exception::kSuccess};
   }
 
  private:
@@ -538,6 +537,9 @@ std::unique_ptr<InputFile> ImplementationPlatform::CreateInputFile(
 
 std::unique_ptr<OutputFile> ImplementationPlatform::CreateOutputFile(
     const std::string& file_path) {
+  std::error_code error;
+  std::filesystem::create_directories(
+      std::filesystem::path(file_path).parent_path(), error);
   return shared::IOFile::CreateOutputFile(file_path);
 }
 
