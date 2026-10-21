@@ -48,6 +48,10 @@ let package = Package(
       type: .dynamic,
       targets: ["NearbyConnections"]
     ),
+    .library(
+      name: "NearbyConnectionsC",
+      targets: ["NearbyConnectionsC"]
+    ),
   ],
   dependencies: [
     // Dependencies declare other packages that this package depends on.

@@ -56,3 +56,6 @@ Cargo.lock
 
 # Bazel
 bazel-*
+linux-build-*.log
+linux-build-*.rc
+linux-verbose.log
