@@ -15,15 +15,62 @@
 #import "internal/platform/implementation/apple/Log/GNCLogger.h"
 
 #import <Foundation/Foundation.h>
+#import <os/log.h>
+
+#include <string.h>
 
 #include "internal/platform/logging.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
+// Mirror of the Nearby Connections log stream in Apple's unified logging system.
+// absl writes to stderr, which is /dev/null for GUI apps; os_log makes the same
+// messages visible via `log stream --process QuickShareMac` (or Console.app),
+// and unlike absl VLOG it does not require a verbosity flag to be enabled.
+static os_log_t GNCNearbyLog(void) {
+  static os_log_t log;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    log = os_log_create("com.google.nearby", "GNCLogger");
+  });
+  return log;
+}
+
+static void GNCWriteToOSLog(GNCLogSeverity severity, NSString *message, const char *fileName,
+                            int lineNumber) {
+  os_log_type_t type;
+  switch (severity) {
+    case GNCLogSeverityDebug:
+      type = OS_LOG_TYPE_DEBUG;
+      break;
+    case GNCLogSeverityInfo:
+      type = OS_LOG_TYPE_INFO;
+      break;
+    case GNCLogSeverityWarning:
+      type = OS_LOG_TYPE_DEFAULT;
+      break;
+    case GNCLogSeverityError:
+      type = OS_LOG_TYPE_ERROR;
+      break;
+    case GNCLogSeverityFatal:
+      type = OS_LOG_TYPE_FAULT;
+      break;
+    default:
+      type = OS_LOG_TYPE_DEFAULT;
+      break;
+  }
+  const char *baseName = strrchr(fileName, '/');
+  baseName = baseName ? baseName + 1 : fileName;
+  os_log_with_type(GNCNearbyLog(), type, "%{public}s:%d %{public}s", baseName, lineNumber,
+                   [message UTF8String]);
+}
+
 void GNCLog(const char *fileName, int lineNumber, GNCLogSeverity severity, NSString *format, ...) {
   va_list arguments;
   va_start(arguments, format);
   NSString *messageString = [[NSString alloc] initWithFormat:format arguments:arguments];
+  va_end(arguments);
+  GNCWriteToOSLog(severity, messageString, fileName, lineNumber);
   switch (severity) {
     case GNCLogSeverityDebug:
       VLOG(1).AtLocation(fileName, lineNumber).WithVerbosity(1)
