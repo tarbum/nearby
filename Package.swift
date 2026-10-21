@@ -18,7 +18,12 @@
 import PackageDescription
 
 #if os(Linux)
-let platformExcludes: [String] = ["internal/platform/implementation/apple"]
+let platformExcludes: [String] = [
+  "internal/platform/implementation/apple",
+  "connections/implementation/mediums/awdl/awdl.cc",
+  "connections/implementation/mediums/wifi_direct/wifi_direct.cc",
+  "connections/implementation/mediums/wifi_aware/wifi_aware.cc",
+]
 let stubExcludes: [String] = []
 #else
 let platformExcludes: [String] = []
@@ -564,6 +569,9 @@ let package = Package(
         .headerSearchPath("third_party/ukey2/compiled_proto/src/main/proto"),
         .define("NO_WEBRTC"),
         .define("GITHUB_BUILD"),
+      ],
+      linkerSettings: [
+        .linkedLibrary("m")
       ]
     ),
     .target(

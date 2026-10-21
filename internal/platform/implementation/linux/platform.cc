@@ -14,6 +14,7 @@
 
 #include "internal/platform/implementation/platform.h"
 
+#include <openssl/sha.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -56,6 +57,7 @@
 #include "internal/platform/implementation/bluetooth_classic.h"
 #include "internal/platform/implementation/condition_variable.h"
 #include "internal/platform/implementation/count_down_latch.h"
+#include "internal/platform/implementation/crypto.h"
 #include "internal/platform/implementation/input_file.h"
 #include "internal/platform/implementation/log_message.h"
 #include "internal/platform/implementation/mutex.h"
@@ -637,6 +639,13 @@ absl::StatusOr<WebResponse> ImplementationPlatform::SendRequest(
 }
 
 }  // namespace api
+
+ByteArray Crypto::Sha256(absl::string_view input) {
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(input.data()), input.size(),
+         digest);
+  return ByteArray(reinterpret_cast<const char*>(digest), sizeof(digest));
+}
 
 absl::Time SystemClock::ElapsedRealtime() { return absl::Now(); }
 

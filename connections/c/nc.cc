@@ -306,8 +306,8 @@ void NcCloseService(NC_INSTANCE instance) {
   });
 
   kNcContextMap->erase(nc_context->core);
-  delete nc_context->router;
   delete nc_context->core;
+  delete nc_context->router;
   if (nc_context->event_logger != nullptr) {
     delete nc_context->event_logger;
   }
