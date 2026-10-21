@@ -47,14 +47,60 @@ static const UInt8 kMaxRetryCount = 3;
 static const UInt8 kConnectionTimeoutInSeconds = 2;
 
 // The Group Owner starts beaconing shortly after the credentials frame is
-// received, but macOS scan results can lag, so the scan itself is retried
-// before giving up (up to ~15s total).
-static const UInt8 kMaxScanRetryCount = 8;
-static const NSTimeInterval kScanRetryDelayInSeconds = 1.5;
+// received, but macOS scan results can lag. This budget must stay short: the
+// caller keeps trying other mediums while this blocks, and a long scan loop
+// used to delay the Wi-Fi LAN fallback by over a minute.
+// Worst case: 3 scans (~2s each) + 2 * 0.5s delay + 3 associate attempts.
+static const UInt8 kMaxScanRetryCount = 3;
+static const NSTimeInterval kScanRetryDelayInSeconds = 0.5;
 #endif  // TARGET_OS_IOS
 
 // An arbitrary timeout that should be pretty lenient.
 static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
+
+// CoreWLAN allows only one scan across the process at a time. Wi-Fi Direct and
+// hotspot upgrades run on separate threads, so concurrent scans fail with EBUSY
+// ("Resource busy") and the upgrade is abandoned. Serialize them here.
+static NSSet<CWNetwork *> *GNCScanForNetworksSerially(CWInterface *interface, NSData *ssid,
+                                                    NSError **error) {
+  static dispatch_queue_t scanQueue;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    scanQueue = dispatch_queue_create("com.google.nearby.wifi-scan", DISPATCH_QUEUE_SERIAL);
+  });
+  __block NSSet<CWNetwork *> *networks = nil;
+  __block NSError *scanError = nil;
+  dispatch_sync(scanQueue, ^{
+    networks = [interface scanForNetworksWithSSID:ssid error:&scanError];
+  });
+  if (error) {
+    *error = scanError;
+  }
+  return networks;
+}
+
+static BOOL GNCNWErrorIsResourceBusy(NSError *error) {
+  return [error.domain isEqualToString:NSPOSIXErrorDomain] && error.code == EBUSY;
+}
+
+// 2.4 GHz tops out around 5-8 MB/s on a Direct/hotspot link in practice; 5/6 GHz
+// is several times faster. When the same SSID is visible on both bands, take the
+// high band unless 2.4 GHz is materially stronger.
+static BOOL GNCNetworkIsHighBand(CWNetwork *network) {
+  return network.wlanChannel.channelNumber > 14;
+}
+
+static BOOL GNCIsBetterNetwork(CWNetwork *candidate, CWNetwork *current) {
+  BOOL candidateHigh = GNCNetworkIsHighBand(candidate);
+  BOOL currentHigh = GNCNetworkIsHighBand(current);
+  if (candidateHigh != currentHigh) {
+    if (candidateHigh) {
+      return candidate.rssiValue >= current.rssiValue - 12;
+    }
+    return candidate.rssiValue > current.rssiValue + 12;
+  }
+  return candidate.rssiValue > current.rssiValue;
+}
 
 @interface GNCHotspotMedium ()
 @property(nonatomic) CLLocationManager *locationManager;
@@ -183,6 +229,9 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
 
   NSError *error = nil;
   CWNetwork *bestNetwork = nil;
+  GNCLoggerInfo(@"Joining hotspot %@ (up to %d scans, %.1fs apart)", ssid, kMaxScanRetryCount,
+                kScanRetryDelayInSeconds);
+  NSData *ssidData = [ssid dataUsingEncoding:NSUTF8StringEncoding];
   // The Group Owner may not be beaconing yet when the credentials frame
   // arrives; retry the scan before declaring the network missing.
   for (int scanAttempt = 0; scanAttempt < kMaxScanRetryCount && !bestNetwork;
@@ -191,31 +240,44 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
       [NSThread sleepForTimeInterval:kScanRetryDelayInSeconds];
     }
     NSSet<CWNetwork *> *networks =
-        [wifiInterface scanForNetworksWithSSID:[ssid dataUsingEncoding:NSUTF8StringEncoding]
-                                         error:&error];
+        GNCScanForNetworksSerially(wifiInterface, ssidData, &error);
+    if (!networks && GNCNWErrorIsResourceBusy(error)) {
+      // Another upgrade thread holds the radio; wait it out instead of
+      // burning the attempt. CoreWLAN serializes scans process-wide.
+      GNCLoggerInfo(@"Scan for %@ is busy, retrying once", ssid);
+      [NSThread sleepForTimeInterval:0.25];
+      networks = GNCScanForNetworksSerially(wifiInterface, ssidData, &error);
+    }
     if (!networks) {
       GNCLoggerError(@"Failed to scan for networks (attempt %d): %@",
                      scanAttempt, error);
       continue;
     }
+    GNCLoggerInfo(@"Scan attempt %d for %@ found %lu network(s)", scanAttempt, ssid,
+                  (unsigned long)networks.count);
     for (CWNetwork *network in networks) {
-      if (bestNetwork == nil ||
-          network.rssiValue > bestNetwork.rssiValue) {
+      if (bestNetwork == nil || GNCIsBetterNetwork(network, bestNetwork)) {
         bestNetwork = network;
       }
     }
   }
 
   if (!bestNetwork) {
-    GNCLoggerError(@"Failed to find network: %@", ssid);
+    GNCLoggerError(@"Failed to find network: %@ (after %d scans), giving up on hotspot",
+                   ssid, kMaxScanRetryCount);
     return NO;
   }
+  GNCLoggerInfo(@"Found hotspot %@ (rssi %ld, channel %ld, band %@), associating", ssid,
+                (long)bestNetwork.rssiValue, (long)bestNetwork.wlanChannel.channelNumber,
+                GNCNetworkIsHighBand(bestNetwork) ? @"5/6GHz" : @"2.4GHz");
 
   for (int i = 0; i < kMaxRetryCount; ++i) {
     BOOL success = [wifiInterface associateToNetwork:bestNetwork password:password error:&error];
 
     if (success) {
-      GNCLoggerInfo(@"Successfully connected to %@", ssid);
+      GNCLoggerInfo(@"Successfully connected to %@ (channel %ld, band %@)", ssid,
+                    (long)wifiInterface.wlanChannel.channelNumber,
+                    GNCNetworkIsHighBand(bestNetwork) ? @"5/6GHz" : @"2.4GHz");
       return YES;
     } else {
       GNCLoggerError(@"Failed to connect to %@ at attempt %d. Error: %@", ssid, i, error);
