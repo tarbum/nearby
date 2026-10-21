@@ -17,6 +17,18 @@
 
 import PackageDescription
 
+#if os(Linux)
+let platformExcludes: [String] = ["internal/platform/implementation/apple"]
+let stubExcludes: [String] = []
+#else
+let platformExcludes: [String] = []
+let stubExcludes: [String] = [
+  "connections/implementation/mediums/awdl/awdl_stub.cc",
+  "connections/implementation/mediums/wifi_direct/wifi_direct_stub.cc",
+  "connections/implementation/mediums/wifi_aware/wifi_aware_stub.cc",
+]
+#endif
+
 let package = Package(
   name: "NearbyConnections",
   platforms: [
@@ -318,12 +330,9 @@ let package = Package(
         "internal/platform/implementation/windows",
         "third_party",
         // non-Apple mediums
-        "connections/implementation/mediums/awdl/awdl_stub.cc",
-        "connections/implementation/mediums/wifi_direct/wifi_direct_stub.cc",
         "connections/implementation/mediums/bluetooth/bluetooth_bwu_handler.cc",
         "connections/implementation/mediums/bluetooth/bluetooth_classic.cc",
         "connections/implementation/mediums/bluetooth/bluetooth_endpoint_channel.cc",
-        "connections/implementation/mediums/wifi_aware/wifi_aware_stub.cc",
         // build files
         "connections/implementation/analytics/BUILD",
         "connections/implementation/flags/BUILD",
@@ -536,7 +545,7 @@ let package = Package(
         "internal/platform/implementation/apple/webrtc.mm",
         // Only used in tests
         "internal/platform/medium_environment.cc",
-      ],
+      ] + platformExcludes + stubExcludes,
       sources: [
         "compiled_proto",
         "connections",
@@ -602,6 +611,11 @@ let package = Package(
       name: "NearbyConnectionsTests",
       dependencies: ["NearbyConnections"],
       path: "connections/swift/NearbyConnections/Tests"
+    ),
+    .executableTarget(
+      name: "LinuxSmoke",
+      dependencies: ["NearbyConnectionsC"],
+      path: "smoke"
     ),
   ],
   cLanguageStandard: .c99,
