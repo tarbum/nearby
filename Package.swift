@@ -124,7 +124,7 @@ let package = Package(
       publicHeadersPath: ".",
       cSettings: [
         .headerSearchPath("./")
-      ],
+      ]
     ),
     .target(
       name: "protobuf",
