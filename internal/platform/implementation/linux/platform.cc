@@ -71,6 +71,7 @@
 #include "internal/platform/implementation/shared/count_down_latch.h"
 #include "internal/platform/implementation/linux/wifi_lan.h"
 #include "internal/platform/implementation/shared/file.h"
+#include "internal/platform/implementation/system_clock.h"
 #include "internal/platform/logging.h"
 #include "internal/platform/nsd_service_info.h"
 #include "internal/platform/service_address.h"
@@ -487,13 +488,13 @@ class AppLifecycleMonitorImpl final : public api::AppLifecycleMonitor {
 
 }  // namespace
 
-int GetCurrentTid() {
-  return static_cast<int>(syscall(SYS_gettid));
-}
-
 }  // namespace linux_platform
 
 namespace api {
+
+int GetCurrentTid() {
+  return static_cast<int>(syscall(SYS_gettid));
+}
 
 std::string ImplementationPlatform::GetCustomSavePath(
     const std::string& save_path, const std::string& parent_folder,
@@ -636,4 +637,12 @@ absl::StatusOr<WebResponse> ImplementationPlatform::SendRequest(
 }
 
 }  // namespace api
+
+absl::Time SystemClock::ElapsedRealtime() { return absl::Now(); }
+
+Exception SystemClock::Sleep(absl::Duration duration) {
+  absl::SleepFor(duration);
+  return {Exception::kSuccess};
+}
+
 }  // namespace nearby

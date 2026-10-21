@@ -304,7 +304,7 @@ class DiscoveryProcess {
     if (fields.size() < 10) return;
     NsdServiceInfo info;
     info.SetServiceName(name);
-    info.SetServiceType(fields[4]);
+    info.SetServiceType(service_type_);
     info.SetIPAddress(fields[7]);
     info.SetPort(std::stoi(fields[8]));
     SetTxtRecords(fields[9], info);
@@ -357,7 +357,8 @@ class WifiLanMediumImpl final : public api::WifiLanMedium {
     std::lock_guard<std::mutex> lock(mutex_);
     std::string type = NormalizeServiceType(service_type);
     if (discovery_.contains(type)) return false;
-    auto process = std::make_unique<DiscoveryProcess>(type, std::move(callback));
+    auto process =
+        std::make_unique<DiscoveryProcess>(service_type, std::move(callback));
     if (!process->Start()) return false;
     discovery_[type] = std::move(process);
     return true;
