@@ -130,6 +130,12 @@ BwuManager::BwuManager(
   if (std::getenv("QUICKSHARE_DISABLE_WIFI_LAN_UPGRADE") != nullptr) {
     config_.allow_upgrade_to.wifi_lan = false;
   }
+  if (std::getenv("QUICKSHARE_DISABLE_WIFI_DIRECT_UPGRADE") != nullptr) {
+    config_.allow_upgrade_to.wifi_direct = false;
+  }
+  if (std::getenv("QUICKSHARE_DISABLE_WIFI_HOTSPOT_UPGRADE") != nullptr) {
+    config_.allow_upgrade_to.wifi_hotspot = false;
+  }
 
   if (!handlers.empty()) {
     handlers_ = std::move(handlers);
