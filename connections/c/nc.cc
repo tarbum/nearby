@@ -651,6 +651,12 @@ void NcAcceptConnection(NC_INSTANCE instance, int endpoint_id,
           nc_payload.content.file.parent_folder =
               (char*)payload.GetParentFolder().c_str();
           nc_payload.content.file.offset = payload.GetOffset();
+          if (payload.AsFile() != nullptr) {
+            nc_payload.content.file.local_path =
+                (char*)payload.AsFile()->GetFilePath().c_str();
+          } else {
+            nc_payload.content.file.local_path = nullptr;
+          }
         } else if (nc_payload.type == NC_PAYLOAD_TYPE_STREAM) {
           // TODO(guogang): support stream later.
         }

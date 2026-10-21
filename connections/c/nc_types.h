@@ -256,6 +256,7 @@ typedef struct NC_FILE_PAYLOAD {
   int64_t offset;
   char* file_name;
   char* parent_folder;
+  char* local_path;
 } NC_FILE_PAYLOAD;
 
 typedef union NC_PAYLOAD_CONTENT {

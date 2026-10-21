@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -87,6 +88,7 @@ pid_t Spawn(const std::vector<std::string>& args, int* read_fd, bool capture) {
   }
 
   if (pid == 0) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
     if (capture) {
       dup2(pipe_fds[1], STDOUT_FILENO);
       close(pipe_fds[0]);
@@ -202,7 +204,7 @@ class WifiLanServerSocketImpl final : public api::WifiLanServerSocket {
     if (fd_ < 0) return nullptr;
     int client;
     do {
-      client = accept(fd_, nullptr, nullptr);
+      client = accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
     } while (client < 0 && errno == EINTR);
     if (client < 0) return nullptr;
     return std::make_unique<WifiLanSocketImpl>(client);
@@ -337,7 +339,10 @@ class WifiLanMediumImpl final : public api::WifiLanMedium {
       args.push_back(absl::StrCat(key, "=", value));
     }
     pid_t pid = Spawn(args, nullptr, false);
-    if (pid <= 0) return false;
+    if (pid <= 0) {
+      LOG(ERROR) << "WifiLan could not spawn avahi-publish-service";
+      return false;
+    }
     advertising_[service_type] = pid;
     return true;
   }
@@ -393,7 +398,7 @@ class WifiLanMediumImpl final : public api::WifiLanMedium {
 
   std::unique_ptr<api::WifiLanServerSocket> ListenForService(
       int port = 0) override {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return nullptr;
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -402,8 +407,28 @@ class WifiLanMediumImpl final : public api::WifiLanMedium {
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(static_cast<uint16_t>(port));
-    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        listen(fd, 16) != 0) {
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+      if (errno == EADDRINUSE && port != 0) {
+        address.sin_port = 0;
+        if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==
+            0) {
+          LOG(INFO) << "WifiLan port " << port
+                    << " is busy; using an ephemeral port";
+        } else {
+          LOG(ERROR) << "WifiLan bind failed: " << strerror(errno);
+          close(fd);
+          return nullptr;
+        }
+      } else {
+        LOG(ERROR) << "WifiLan bind failed on port " << port << ": "
+                   << strerror(errno);
+        close(fd);
+        return nullptr;
+      }
+    }
+    if (listen(fd, 16) != 0) {
+      LOG(ERROR) << "WifiLan listen failed on port " << port << ": "
+                 << strerror(errno);
       close(fd);
       return nullptr;
     }
@@ -455,7 +480,9 @@ class WifiLanMediumImpl final : public api::WifiLanMedium {
     int fd = -1;
     for (addrinfo* address = addresses; address != nullptr;
          address = address->ai_next) {
-      fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+      fd = socket(address->ai_family,
+                  address->ai_socktype | SOCK_CLOEXEC,
+                  address->ai_protocol);
       if (fd < 0) continue;
       if (connect(fd, address->ai_addr, address->ai_addrlen) == 0) break;
       close(fd);
