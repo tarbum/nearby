@@ -18,6 +18,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -441,6 +442,18 @@ int BaseEndpointChannel::GetMaxAllowedReadBytes() const {
 }
 
 int BaseEndpointChannel::GetDefaultMaxTransmitPacketSize() const {
+  // Local experiment knob for the payload chunk size (Wi-Fi LAN / hotspot /
+  // direct; BLE channels override this method with their own values). The chunk
+  // size is not negotiated, so raising it stays wire-compatible as long as a
+  // frame remains under kMediumMaxAllowedReadBytes (1 MiB), enforced on read.
+  if (const char* override_kib = std::getenv("NEARBY_CHUNK_SIZE_KIB")) {
+    char* end = nullptr;
+    const long kib = std::strtol(override_kib, &end, 10);
+    if (end != override_kib && kib >= 16 && kib <= 512) {
+      LOG(INFO) << "Using payload chunk size override: " << kib << " KiB";
+      return static_cast<int>(kib * 1024);
+    }
+  }
   int32_t default_max_transmit_packet_size =
       NearbyFlags::GetInstance().GetInt64Flag(
           config_package_nearby::nearby_connections_feature::
