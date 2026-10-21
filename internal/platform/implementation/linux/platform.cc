@@ -71,6 +71,7 @@
 #include "internal/platform/implementation/wifi_hotspot.h"
 #include "internal/platform/implementation/wifi_lan.h"
 #include "internal/platform/implementation/shared/count_down_latch.h"
+#include "internal/platform/implementation/linux/ble.h"
 #include "internal/platform/implementation/linux/wifi_lan.h"
 #include "internal/platform/implementation/shared/file.h"
 #include "internal/platform/implementation/system_clock.h"
@@ -469,17 +470,6 @@ class WifiMediumImpl final : public api::WifiMedium {
   api::WifiInformation information_;
 };
 
-class BluetoothAdapterImpl final : public api::BluetoothAdapter {
- public:
-  bool SetStatus(Status status) override { return false; }
-  bool IsEnabled() const override { return false; }
-  ScanMode GetScanMode() const override { return ScanMode::kNone; }
-  bool SetScanMode(ScanMode scan_mode) override { return false; }
-  std::string GetName() const override { return ""; }
-  bool SetName(absl::string_view name, bool persist) override { return false; }
-  MacAddress GetMacAddress() const override { return MacAddress(); }
-};
-
 class AppLifecycleMonitorImpl final : public api::AppLifecycleMonitor {
  public:
   explicit AppLifecycleMonitorImpl(
@@ -576,7 +566,7 @@ std::unique_ptr<AwdlMedium> ImplementationPlatform::CreateAwdlMedium() {
 
 std::unique_ptr<BluetoothAdapter>
 ImplementationPlatform::CreateBluetoothAdapter() {
-  return std::make_unique<linux_platform::BluetoothAdapterImpl>();
+  return linux_platform::CreateBluetoothAdapter();
 }
 
 std::unique_ptr<BluetoothClassicMedium>
@@ -586,7 +576,7 @@ ImplementationPlatform::CreateBluetoothClassicMedium(BluetoothAdapter&) {
 
 std::unique_ptr<api::ble::BleMedium> ImplementationPlatform::CreateBleMedium(
     api::BluetoothAdapter&) {
-  return nullptr;
+  return linux_platform::CreateBleMedium();
 }
 
 std::unique_ptr<api::CredentialStorage>

@@ -72,6 +72,14 @@ let package = Package(
   targets: [
     // Targets are the basic building blocks of a package. A target can define a module or a test suite.
     // Targets can depend on other targets in this package, and on products in packages this package depends on.
+    .systemLibrary(
+      name: "CGio",
+      path: "Sources/CGio",
+      pkgConfig: "gio-2.0",
+      providers: [
+        .apt(["libglib2.0-dev"])
+      ]
+    ),
     .target(
       name: "smhasher",
       path: "third_party/smhasher",
@@ -313,6 +321,7 @@ let package = Package(
     .target(
       name: "NearbyCommon",
       dependencies: [
+        "CGio",
         "json",
         "smhasher",
         "ukey2",
