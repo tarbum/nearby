@@ -97,7 +97,8 @@ ExceptionOr<ByteArray> BaseEndpointChannel::Read() {
     ExceptionOr<std::int32_t> read_int;
     if (NearbyFlags::GetInstance().GetBoolFlag(
             config_package_nearby::nearby_connections_feature::
-                kRefactorBleL2cap)) {
+                kRefactorBleL2cap) &&
+        (GetMedium() == BLE || GetMedium() == BLE_L2CAP)) {
       ExceptionOr<ByteArray> read_control_block_bytes = DispatchPacket();
       if (!read_control_block_bytes.ok()) {
         LOG(WARNING) << __func__ << ": Failed to dispatch packet: "

@@ -244,6 +244,7 @@ void BaseSocket::OnReceiveDataPacket(Packet packet) {
   }
   absl::StatusOr<ByteArray> message = packetizer_.TakeMessage();
   if (!message.ok()) {
+    if (absl::IsUnavailable(message.status())) return;
     DisconnectInternal(message.status());
     return;
   }

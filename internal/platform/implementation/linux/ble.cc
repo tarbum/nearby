@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <tuple>
 #include <condition_variable>
 #include <cstring>
 #include <memory>
@@ -29,6 +32,10 @@
 #include "internal/platform/logging.h"
 #include "internal/platform/mac_address.h"
 #include "internal/platform/uuid.h"
+#include "internal/weave/connection.h"
+#include "internal/weave/socket_callback.h"
+#include "internal/weave/sockets/client_socket.h"
+#include "internal/weave/sockets/server_socket.h"
 
 namespace nearby {
 namespace linux_platform {
@@ -773,7 +780,7 @@ class BleMediumImpl final : public api::ble::BleMedium {
         G_DBUS_SIGNAL_FLAGS_NONE, OnInterfacesAdded, this, nullptr);
     changed_subscription_ = g_dbus_connection_signal_subscribe(
         BluezConnection::Get()->connection(), nullptr,
-        "org.freedesktop.DBus.Properties", "PropertiesChanged", "/", nullptr,
+        "org.freedesktop.DBus.Properties", "PropertiesChanged", nullptr, nullptr,
         G_DBUS_SIGNAL_FLAGS_NONE, OnPropertiesChanged, this, nullptr);
   }
 
@@ -909,16 +916,12 @@ class BleMediumImpl final : public api::ble::BleMedium {
   }
 
   std::unique_ptr<api::ble::BleServerSocket> OpenServerSocket(
-      const std::string& service_id) override {
-    return std::make_unique<DummyBleServerSocket>();
-  }
+      const std::string& service_id) override;
 
   std::unique_ptr<api::ble::BleSocket> Connect(
       const std::string& service_id, TxPowerLevel tx_power_level,
       BlePeripheral::UniqueId peripheral_id,
-      CancellationFlag* cancellation_flag) override {
-    return nullptr;
-  }
+      CancellationFlag* cancellation_flag) override;
 
   bool IsExtendedAdvertisementsAvailable() override { return false; }
 
@@ -1186,7 +1189,7 @@ class BleMediumImpl final : public api::ble::BleMedium {
   void HandleInterfacesAdded(GVariant* parameters) {
     const gchar* path = nullptr;
     GVariant* interfaces = nullptr;
-    g_variant_get(parameters, "(&o@a{sv})", &path, &interfaces);
+    g_variant_get(parameters, "(&o@a{sa{sv}})", &path, &interfaces);
     GVariant* properties = g_variant_lookup_value(
         interfaces, "org.bluez.Device1", G_VARIANT_TYPE("a{sv}"));
     if (properties != nullptr) {
@@ -1310,6 +1313,950 @@ std::unique_ptr<api::BluetoothAdapter> CreateBluetoothAdapter() {
 
 std::unique_ptr<api::ble::BleMedium> CreateBleMedium() {
   return std::make_unique<BleMediumImpl>();
+}
+
+}  // namespace linux_platform
+}  // namespace nearby
+
+namespace nearby {
+namespace linux_platform {
+
+namespace weave = ::nearby::weave;
+
+namespace {
+
+constexpr char kWeaveServiceUuid[] =
+    "0000fef3-0000-1000-8000-00805f9b34fb";
+constexpr char kWeaveToPeripheralUuid[] =
+    "00000100-0004-1000-8000-001a11000101";
+constexpr char kWeaveFromPeripheralUuid[] =
+    "00000100-0004-1000-8000-001a11000102";
+constexpr int kWeavePacketSize = 512;
+
+std::string Lowercase(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return value;
+}
+
+class WeaveInput final : public InputStream {
+ public:
+  void Push(std::string message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    messages_.push_back(std::move(message));
+    condition_.notify_all();
+  }
+
+  ExceptionOr<ByteArray> Read(std::int64_t size) override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [this]() { return closed_ || !messages_.empty(); });
+    if (messages_.empty()) return ExceptionOr<ByteArray>{Exception::kIo};
+    std::string result;
+    while (!messages_.empty()) {
+      absl::StrAppend(&result, messages_.front());
+      messages_.pop_front();
+      if (size >= 0 && result.size() >= static_cast<size_t>(size)) break;
+    }
+    if (size >= 0 && result.size() > static_cast<size_t>(size)) {
+      std::string remainder = result.substr(size);
+      result.resize(size);
+      messages_.push_front(std::move(remainder));
+    }
+    return ExceptionOr<ByteArray>{ByteArray(std::move(result))};
+  }
+
+  Exception Close() override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closed_ = true;
+    }
+    condition_.notify_all();
+    return {Exception::kSuccess};
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<std::string> messages_;
+  bool closed_ = false;
+};
+
+class WeaveOutput final : public OutputStream {
+ public:
+  explicit WeaveOutput(std::shared_ptr<weave::BaseSocket> socket)
+      : socket_(std::move(socket)) {}
+
+  Exception Write(absl::string_view data) override {
+    if (!socket_) return {Exception::kIo};
+    auto future = socket_->Write(ByteArray(std::string(data)));
+    auto result = future.Get(absl::Seconds(10));
+    if (!result.ok() || !result.result().ok()) return {Exception::kIo};
+    return {Exception::kSuccess};
+  }
+
+  Exception Flush() override { return {Exception::kSuccess}; }
+  Exception Close() override {
+    socket_.reset();
+    return {Exception::kSuccess};
+  }
+
+ private:
+  std::shared_ptr<weave::BaseSocket> socket_;
+};
+
+class WeaveTransport : public weave::Connection {
+ public:
+  void Initialize(weave::ConnectionCallback callback) override {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    transmit_cb_ = std::make_shared<absl::AnyInvocable<void(absl::Status)>>(
+        std::move(callback.on_transmit_cb));
+    receive_cb_ = std::make_shared<absl::AnyInvocable<void(std::string)>>(
+        std::move(callback.on_remote_transmit_cb));
+    disconnected_cb_ = std::make_shared<absl::AnyInvocable<void()>>(
+        std::move(callback.on_disconnected_cb));
+  }
+
+  int GetMaxPacketSize() const override { return kWeavePacketSize; }
+  void Close() override {
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true)) return;
+    std::shared_ptr<absl::AnyInvocable<void()>> callback;
+    {
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      callback = disconnected_cb_;
+    }
+    if (callback != nullptr && *callback) (*callback)();
+  }
+
+  void Receive(const std::string& data) {
+    std::shared_ptr<absl::AnyInvocable<void(std::string)>> callback;
+    {
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      callback = receive_cb_;
+    }
+    if (callback != nullptr && *callback) (*callback)(data);
+  }
+
+ protected:
+  void NotifyTransmit(absl::Status status) {
+    std::shared_ptr<absl::AnyInvocable<void(absl::Status)>> callback;
+    {
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      callback = transmit_cb_;
+    }
+    if (callback != nullptr && *callback) (*callback)(status);
+  }
+
+  std::atomic_bool closed_{false};
+
+ private:
+  std::mutex callback_mutex_;
+  std::shared_ptr<absl::AnyInvocable<void(absl::Status)>> transmit_cb_;
+  std::shared_ptr<absl::AnyInvocable<void(std::string)>> receive_cb_;
+  std::shared_ptr<absl::AnyInvocable<void()>> disconnected_cb_;
+};
+
+class WeaveGattServer {
+ public:
+  explicit WeaveGattServer(std::function<void(std::string)> on_write)
+      : on_write_(std::move(on_write)) {}
+
+  ~WeaveGattServer() { Stop(); }
+
+  bool Start() { return Register(); }
+
+  void Stop() {
+    if (!registered_) return;
+    registered_ = false;
+    if (BluezConnection::Get()->available()) {
+      CallMethod(BluezConnection::Get()->connection(),
+                 BluezConnection::Get()->adapter_path(), "org.bluez.GattManager1",
+                 "UnregisterApplication",
+                 g_variant_new("(o)", kApplicationPath));
+      for (guint id : registrations_) {
+        g_dbus_connection_unregister_object(
+            BluezConnection::Get()->connection(), id);
+      }
+      registrations_.clear();
+    }
+  }
+
+  bool Notify(const std::string& data) {
+    if (!BluezConnection::Get()->available()) return false;
+    GVariantBuilder changed;
+    g_variant_builder_init(&changed, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(
+        &changed, "{sv}", "Value",
+        g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, data.data(),
+                                  data.size(), 1));
+    GVariantBuilder invalidated;
+    g_variant_builder_init(&invalidated, G_VARIANT_TYPE("as"));
+    GError* error = nullptr;
+    gboolean result = g_dbus_connection_emit_signal(
+        BluezConnection::Get()->connection(), nullptr, kFromPath,
+        "org.freedesktop.DBus.Properties", "PropertiesChanged",
+        g_variant_new("(s@a{sv}@as)", "org.bluez.GattCharacteristic1",
+                      g_variant_builder_end(&changed),
+                      g_variant_builder_end(&invalidated)),
+        &error);
+    if (error != nullptr) g_error_free(error);
+    return result;
+  }
+
+ private:
+  static constexpr char kApplicationPath[] = "/com/tarbum/quickshare/weave";
+  static constexpr char kServicePath[] =
+      "/com/tarbum/quickshare/weave/service0";
+  static constexpr char kToPath[] =
+      "/com/tarbum/quickshare/weave/service0/to";
+  static constexpr char kFromPath[] =
+      "/com/tarbum/quickshare/weave/service0/from";
+
+  static void OnMethodCall(GDBusConnection* connection, const gchar* sender,
+                           const gchar* object_path,
+                           const gchar* interface_name,
+                           const gchar* method_name, GVariant* parameters,
+                           GDBusMethodInvocation* invocation,
+                           gpointer user_data) {
+    auto* server = static_cast<WeaveGattServer*>(user_data);
+    if (std::strcmp(interface_name,
+                    "org.freedesktop.DBus.ObjectManager") == 0 &&
+        std::strcmp(method_name, "GetManagedObjects") == 0) {
+      g_dbus_method_invocation_return_value(
+          invocation,
+          g_variant_new("(@a{oa{sa{sv}}})", server->BuildManagedObjects()));
+      return;
+    }
+    if (std::strcmp(interface_name, "org.bluez.GattCharacteristic1") == 0) {
+      if (std::strcmp(method_name, "StartNotify") == 0 ||
+          std::strcmp(method_name, "StopNotify") == 0) {
+        if (std::strcmp(object_path, kFromPath) == 0) {
+          server->notifying_ = std::strcmp(method_name, "StartNotify") == 0;
+        }
+        g_dbus_method_invocation_return_value(invocation, nullptr);
+        return;
+      }
+      if (std::strcmp(method_name, "ReadValue") == 0) {
+        std::string value = server->ReadValue(object_path);
+        g_dbus_method_invocation_return_value(
+            invocation,
+            g_variant_new("(@ay)",
+                          g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                                    value.data(), value.size(),
+                                                    1)));
+        return;
+      }
+      if (std::strcmp(method_name, "WriteValue") == 0 &&
+          std::strcmp(object_path, kToPath) == 0) {
+        GVariant* bytes = nullptr;
+        GVariant* options = nullptr;
+        g_variant_get(parameters, "(@ay@a{sv})", &bytes, &options);
+        if (bytes != nullptr) {
+          gsize length = 0;
+          const auto* data = static_cast<const char*>(
+              g_variant_get_fixed_array(bytes, &length, sizeof(char)));
+          if (data != nullptr) {
+            server->on_write_(std::string(data, length));
+          }
+          g_variant_unref(bytes);
+        }
+        if (options != nullptr) g_variant_unref(options);
+        g_dbus_method_invocation_return_value(invocation, nullptr);
+        return;
+      }
+    }
+    g_dbus_method_invocation_return_dbus_error(
+        invocation, "org.bluez.Error.NotSupported", "Unsupported method");
+  }
+
+  static GVariant* OnGetProperty(GDBusConnection* connection,
+                                 const gchar* sender,
+                                 const gchar* object_path,
+                                 const gchar* interface_name,
+                                 const gchar* property_name, GError** error,
+                                 gpointer user_data) {
+    return static_cast<WeaveGattServer*>(user_data)->GetProperty(
+        object_path, interface_name, property_name);
+  }
+
+  bool Register() {
+    static const char kApplicationXml[] =
+        "<node><interface name='org.freedesktop.DBus.ObjectManager'>"
+        "<method name='GetManagedObjects'>"
+        "<arg type='a{oa{sa{sv}}}' direction='out'/>"
+        "</method></interface></node>";
+    static const char kServiceXml[] =
+        "<node><interface name='org.bluez.GattService1'>"
+        "<property name='UUID' type='s' access='read'/>"
+        "<property name='Primary' type='b' access='read'/>"
+        "<property name='Characteristics' type='ao' access='read'/>"
+        "</interface></node>";
+    static const char kCharacteristicXml[] =
+        "<node><interface name='org.bluez.GattCharacteristic1'>"
+        "<method name='ReadValue'><arg type='a{sv}' direction='in'/>"
+        "<arg type='ay' direction='out'/></method>"
+        "<method name='WriteValue'><arg type='ay' direction='in'/>"
+        "<arg type='a{sv}' direction='in'/></method>"
+        "<method name='StartNotify'/>"
+        "<method name='StopNotify'/>"
+        "<property name='UUID' type='s' access='read'/>"
+        "<property name='Service' type='o' access='read'/>"
+        "<property name='Flags' type='as' access='read'/>"
+        "<property name='Value' type='ay' access='read'/>"
+        "<property name='Notifying' type='b' access='read'/>"
+        "</interface></node>";
+
+    GDBusNodeInfo* app = g_dbus_node_info_new_for_xml(kApplicationXml, nullptr);
+    GDBusNodeInfo* service =
+        g_dbus_node_info_new_for_xml(kServiceXml, nullptr);
+    GDBusNodeInfo* characteristic =
+        g_dbus_node_info_new_for_xml(kCharacteristicXml, nullptr);
+    if (app == nullptr || service == nullptr || characteristic == nullptr) {
+      if (app) g_dbus_node_info_unref(app);
+      if (service) g_dbus_node_info_unref(service);
+      if (characteristic) g_dbus_node_info_unref(characteristic);
+      return false;
+    }
+    static const GDBusInterfaceVTable app_vtable = {
+        .method_call = OnMethodCall,
+        .get_property = nullptr,
+        .set_property = nullptr,
+    };
+    static const GDBusInterfaceVTable service_vtable = {
+        .method_call = nullptr,
+        .get_property = OnGetProperty,
+        .set_property = nullptr,
+    };
+    static const GDBusInterfaceVTable characteristic_vtable = {
+        .method_call = OnMethodCall,
+        .get_property = OnGetProperty,
+        .set_property = nullptr,
+    };
+    GError* error = nullptr;
+    guint app_id = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kApplicationPath,
+        g_dbus_node_info_lookup_interface(app,
+                                          "org.freedesktop.DBus.ObjectManager"),
+        &app_vtable, this, nullptr, &error);
+    guint service_id = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kServicePath,
+        g_dbus_node_info_lookup_interface(service,
+                                          "org.bluez.GattService1"),
+        &service_vtable, this, nullptr, &error);
+    guint to_id = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kToPath,
+        g_dbus_node_info_lookup_interface(characteristic,
+                                          "org.bluez.GattCharacteristic1"),
+        &characteristic_vtable, this, nullptr, &error);
+    guint from_id = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kFromPath,
+        g_dbus_node_info_lookup_interface(characteristic,
+                                          "org.bluez.GattCharacteristic1"),
+        &characteristic_vtable, this, nullptr, &error);
+    g_dbus_node_info_unref(app);
+    g_dbus_node_info_unref(service);
+    g_dbus_node_info_unref(characteristic);
+    if (app_id == 0 || service_id == 0 || to_id == 0 || from_id == 0) {
+      if (error) g_error_free(error);
+      return false;
+    }
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    bool ok = CallMethod(
+        BluezConnection::Get()->connection(),
+        BluezConnection::Get()->adapter_path(), "org.bluez.GattManager1",
+        "RegisterApplication",
+        g_variant_new("(o@a{sv})", kApplicationPath,
+                      g_variant_builder_end(&options)));
+    if (!ok) {
+      g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
+                                          app_id);
+      g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
+                                          service_id);
+      g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
+                                          to_id);
+      g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
+                                          from_id);
+      return false;
+    }
+    registrations_ = {app_id, service_id, to_id, from_id};
+    registered_ = true;
+    return true;
+  }
+
+  GVariant* BuildManagedObjects() {
+    GVariantBuilder objects;
+    g_variant_builder_init(&objects, G_VARIANT_TYPE("a{oa{sa{sv}}}"));
+    GVariantBuilder service_interfaces;
+    g_variant_builder_init(&service_interfaces, G_VARIANT_TYPE("a{sa{sv}}"));
+    GVariantBuilder service_props;
+    g_variant_builder_init(&service_props, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&service_props, "{sv}", "UUID",
+                          g_variant_new_string(kWeaveServiceUuid));
+    g_variant_builder_add(&service_props, "{sv}", "Primary",
+                          g_variant_new_boolean(true));
+    GVariantBuilder paths;
+    g_variant_builder_init(&paths, G_VARIANT_TYPE("ao"));
+    g_variant_builder_add(&paths, "o", kToPath);
+    g_variant_builder_add(&paths, "o", kFromPath);
+    g_variant_builder_add(&service_props, "{sv}", "Characteristics",
+                          g_variant_builder_end(&paths));
+    g_variant_builder_add(&service_interfaces, "{s@a{sv}}",
+                          "org.bluez.GattService1",
+                          g_variant_builder_end(&service_props));
+    g_variant_builder_add(&objects, "{o@a{sa{sv}}}", kServicePath,
+                          g_variant_builder_end(&service_interfaces));
+
+    for (const auto& [path, uuid, flags] :
+         std::initializer_list<std::tuple<const char*, const char*,
+                                          std::initializer_list<const char*>>>{
+             {kToPath, kWeaveToPeripheralUuid, {"write", "write-without-response"}},
+             {kFromPath, kWeaveFromPeripheralUuid, {"indicate"}}}) {
+      GVariantBuilder interfaces;
+      g_variant_builder_init(&interfaces, G_VARIANT_TYPE("a{sa{sv}}"));
+      GVariantBuilder props;
+      g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
+      g_variant_builder_add(&props, "{sv}", "UUID", g_variant_new_string(uuid));
+      g_variant_builder_add(&props, "{sv}", "Service",
+                            g_variant_new_object_path(kServicePath));
+      GVariantBuilder flag_builder;
+      g_variant_builder_init(&flag_builder, G_VARIANT_TYPE("as"));
+      for (const char* flag : flags) {
+        g_variant_builder_add(&flag_builder, "s", flag);
+      }
+      g_variant_builder_add(&props, "{sv}", "Flags",
+                            g_variant_builder_end(&flag_builder));
+      g_variant_builder_add(&props, "{sv}", "Value",
+                            g_variant_new_fixed_array(
+                                G_VARIANT_TYPE_BYTE, "", 0, 1));
+      g_variant_builder_add(&props, "{sv}", "Notifying",
+                            g_variant_new_boolean(false));
+      g_variant_builder_add(&interfaces, "{s@a{sv}}",
+                            "org.bluez.GattCharacteristic1",
+                            g_variant_builder_end(&props));
+      g_variant_builder_add(&objects, "{o@a{sa{sv}}}", path,
+                            g_variant_builder_end(&interfaces));
+    }
+    return g_variant_builder_end(&objects);
+  }
+
+  std::string ReadValue(const gchar* path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (std::strcmp(path, kToPath) == 0) return to_value_;
+    return from_value_;
+  }
+
+  GVariant* GetProperty(const gchar* path, const gchar* interface,
+                        const gchar* property) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (std::strcmp(interface, "org.bluez.GattService1") == 0) {
+      if (std::strcmp(property, "UUID") == 0) {
+        return g_variant_new_string(kWeaveServiceUuid);
+      }
+      if (std::strcmp(property, "Primary") == 0) {
+        return g_variant_new_boolean(true);
+      }
+      if (std::strcmp(property, "Characteristics") == 0) {
+        GVariantBuilder paths;
+        g_variant_builder_init(&paths, G_VARIANT_TYPE("ao"));
+        g_variant_builder_add(&paths, "o", kToPath);
+        g_variant_builder_add(&paths, "o", kFromPath);
+        return g_variant_builder_end(&paths);
+      }
+    }
+    if (std::strcmp(interface, "org.bluez.GattCharacteristic1") == 0) {
+      bool is_to = std::strcmp(path, kToPath) == 0;
+      if (std::strcmp(property, "UUID") == 0) {
+        return g_variant_new_string(is_to ? kWeaveToPeripheralUuid
+                                         : kWeaveFromPeripheralUuid);
+      }
+      if (std::strcmp(property, "Service") == 0) {
+        return g_variant_new_object_path(kServicePath);
+      }
+      if (std::strcmp(property, "Flags") == 0) {
+        GVariantBuilder flags;
+        g_variant_builder_init(&flags, G_VARIANT_TYPE("as"));
+        if (is_to) {
+          g_variant_builder_add(&flags, "s", "write");
+          g_variant_builder_add(&flags, "s", "write-without-response");
+        } else {
+          g_variant_builder_add(&flags, "s", "indicate");
+        }
+        return g_variant_builder_end(&flags);
+      }
+      if (std::strcmp(property, "Value") == 0) {
+        const std::string& value = is_to ? to_value_ : from_value_;
+        return g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, value.data(),
+                                         value.size(), 1);
+      }
+      if (std::strcmp(property, "Notifying") == 0) {
+        return g_variant_new_boolean(notifying_);
+      }
+    }
+    return nullptr;
+  }
+
+  std::function<void(std::string)> on_write_;
+  std::mutex mutex_;
+  std::string to_value_;
+  std::string from_value_;
+  bool notifying_ = false;
+  bool registered_ = false;
+  std::vector<guint> registrations_;
+};
+
+class WeaveServerTransport final : public WeaveTransport {
+ public:
+  void set_gatt(std::shared_ptr<WeaveGattServer> gatt) { gatt_ = std::move(gatt); }
+
+  void Transmit(std::string packet) override {
+    if (!first_packet_sent_.exchange(true)) usleep(1500000);
+    bool success = gatt_ != nullptr && gatt_->Notify(packet);
+    NotifyTransmit(success ? absl::OkStatus()
+                           : absl::InternalError("BLE notification failed"));
+  }
+
+  std::atomic_bool first_packet_sent_{false};
+
+ private:
+  std::shared_ptr<WeaveGattServer> gatt_;
+};
+
+class WeaveClientTransport;
+
+class WeaveGattClient {
+ public:
+  explicit WeaveGattClient(std::string address)
+      : address_(std::move(address)) {}
+  ~WeaveGattClient() { Close(); }
+
+  bool Connect() {
+    if (!BluezConnection::Get()->available()) return false;
+    if (!FindDevicePath()) return false;
+    if (!CallMethod(BluezConnection::Get()->connection(), device_path_,
+                    "org.bluez.Device1", "Connect", nullptr)) {
+      return false;
+    }
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      if (FindCharacteristics()) {
+        CallMethod(BluezConnection::Get()->connection(), from_path_,
+                   "org.bluez.GattCharacteristic1", "StartNotify", nullptr);
+        Subscribe();
+        return true;
+      }
+      usleep(100000);
+    }
+    return false;
+  }
+
+  bool Write(const std::string& packet) {
+    if (to_path_.empty()) return false;
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    return CallMethod(
+        BluezConnection::Get()->connection(), to_path_,
+        "org.bluez.GattCharacteristic1", "WriteValue",
+        g_variant_new("(@ay@a{sv})",
+                      g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                                packet.data(), packet.size(),
+                                                1),
+                      g_variant_builder_end(&options)));
+  }
+
+  void Close() {
+    if (BluezConnection::Get()->available()) {
+      if (subscription_ != 0) {
+        g_dbus_connection_signal_unsubscribe(
+            BluezConnection::Get()->connection(), subscription_);
+        subscription_ = 0;
+      }
+      if (!device_path_.empty()) {
+        CallMethod(BluezConnection::Get()->connection(), device_path_,
+                   "org.bluez.Device1", "Disconnect", nullptr);
+      }
+    }
+    to_path_.clear();
+    from_path_.clear();
+  }
+
+  void set_transport(std::shared_ptr<WeaveClientTransport> transport) {
+    transport_ = std::move(transport);
+  }
+
+ private:
+  static void OnPropertiesChanged(GDBusConnection* connection,
+                                  const gchar* sender_name,
+                                  const gchar* object_path,
+                                  const gchar* interface_name,
+                                  const gchar* signal_name,
+                                  GVariant* parameters, gpointer user_data) {
+    auto* client = static_cast<WeaveGattClient*>(user_data);
+    client->HandlePropertiesChanged(object_path, parameters);
+  }
+
+  void HandlePropertiesChanged(const gchar* object_path,
+                               GVariant* parameters);
+
+  void Subscribe() {
+    subscription_ = g_dbus_connection_signal_subscribe(
+        BluezConnection::Get()->connection(), nullptr,
+        "org.freedesktop.DBus.Properties", "PropertiesChanged", nullptr, nullptr,
+        G_DBUS_SIGNAL_FLAGS_NONE, OnPropertiesChanged, this, nullptr);
+  }
+
+  bool FindDevicePath() {
+    GError* error = nullptr;
+    GVariant* reply = g_dbus_connection_call_sync(
+        BluezConnection::Get()->connection(), kBlueZService, "/",
+        "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", nullptr,
+        G_VARIANT_TYPE("(a{oa{sa{sv}}})"), G_DBUS_CALL_FLAGS_NONE,
+        kDBusTimeoutMs, nullptr, &error);
+    if (reply == nullptr) {
+      if (error) g_error_free(error);
+      return false;
+    }
+    GVariant* objects = nullptr;
+    g_variant_get(reply, "(@a{oa{sa{sv}}})", &objects);
+    GVariantIter iter;
+    g_variant_iter_init(&iter, objects);
+    const gchar* path = nullptr;
+    GVariant* interfaces = nullptr;
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+      GVariant* props = g_variant_lookup_value(
+          interfaces, "org.bluez.Device1", G_VARIANT_TYPE("a{sv}"));
+      if (props != nullptr) {
+        GVariant* address = g_variant_lookup_value(
+            props, "Address", G_VARIANT_TYPE_STRING);
+        if (address != nullptr &&
+            Lowercase(VariantToString(address)) == Lowercase(address_)) {
+          device_path_ = path;
+          g_variant_unref(address);
+          g_variant_unref(props);
+          g_variant_unref(interfaces);
+          break;
+        }
+        if (address != nullptr) g_variant_unref(address);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    g_variant_unref(objects);
+    g_variant_unref(reply);
+    return !device_path_.empty();
+  }
+
+  bool FindCharacteristics() {
+    GError* error = nullptr;
+    GVariant* reply = g_dbus_connection_call_sync(
+        BluezConnection::Get()->connection(), kBlueZService, "/",
+        "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", nullptr,
+        G_VARIANT_TYPE("(a{oa{sa{sv}}})"), G_DBUS_CALL_FLAGS_NONE,
+        kDBusTimeoutMs, nullptr, &error);
+    if (reply == nullptr) {
+      if (error) g_error_free(error);
+      return false;
+    }
+    GVariant* objects = nullptr;
+    g_variant_get(reply, "(@a{oa{sa{sv}}})", &objects);
+    GVariantIter iter;
+    g_variant_iter_init(&iter, objects);
+    const gchar* path = nullptr;
+    GVariant* interfaces = nullptr;
+    std::string service_path;
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+      GVariant* props = g_variant_lookup_value(
+          interfaces, "org.bluez.GattService1", G_VARIANT_TYPE("a{sv}"));
+      if (props != nullptr) {
+        GVariant* uuid = g_variant_lookup_value(
+            props, "UUID", G_VARIANT_TYPE_STRING);
+        if (uuid != nullptr &&
+            Lowercase(VariantToString(uuid)) == Lowercase(kWeaveServiceUuid)) {
+          service_path = path;
+          g_variant_unref(uuid);
+          g_variant_unref(props);
+          g_variant_unref(interfaces);
+          break;
+        }
+        if (uuid != nullptr) g_variant_unref(uuid);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    if (service_path.empty()) {
+      g_variant_unref(objects);
+      g_variant_unref(reply);
+      return false;
+    }
+    g_variant_iter_init(&iter, objects);
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+      GVariant* props = g_variant_lookup_value(
+          interfaces, "org.bluez.GattCharacteristic1", G_VARIANT_TYPE("a{sv}"));
+      if (props != nullptr) {
+        GVariant* uuid = g_variant_lookup_value(props, "UUID",
+                                                G_VARIANT_TYPE_STRING);
+        GVariant* service = g_variant_lookup_value(
+            props, "Service", G_VARIANT_TYPE_OBJECT_PATH);
+        if (uuid != nullptr && service != nullptr &&
+            VariantToString(service) == service_path) {
+          std::string value = Lowercase(VariantToString(uuid));
+          if (value == Lowercase(kWeaveToPeripheralUuid)) to_path_ = path;
+          if (value == Lowercase(kWeaveFromPeripheralUuid)) from_path_ = path;
+        }
+        if (uuid != nullptr) g_variant_unref(uuid);
+        if (service != nullptr) g_variant_unref(service);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    g_variant_unref(objects);
+    g_variant_unref(reply);
+    return !to_path_.empty() && !from_path_.empty();
+  }
+
+  std::string address_;
+  std::string device_path_;
+  std::string to_path_;
+  std::string from_path_;
+  guint subscription_ = 0;
+  std::shared_ptr<WeaveClientTransport> transport_;
+};
+
+class WeaveClientTransport final : public WeaveTransport {
+ public:
+  explicit WeaveClientTransport(std::shared_ptr<WeaveGattClient> client)
+      : client_(std::move(client)) {}
+
+  void Transmit(std::string packet) override {
+    bool success = client_ != nullptr && client_->Write(packet);
+    NotifyTransmit(success ? absl::OkStatus()
+                           : absl::InternalError("BLE write failed"));
+  }
+
+ private:
+  std::shared_ptr<WeaveGattClient> client_;
+};
+
+void WeaveGattClient::HandlePropertiesChanged(const gchar* object_path,
+                                             GVariant* parameters) {
+  if (from_path_.empty() || std::strcmp(object_path, from_path_.c_str()) != 0) {
+    return;
+  }
+  const gchar* interface = nullptr;
+  GVariant* changed = nullptr;
+  GVariant* invalidated = nullptr;
+  g_variant_get(parameters, "(&s@a{sv}@as)", &interface, &changed, &invalidated);
+  if (std::strcmp(interface, "org.bluez.GattCharacteristic1") == 0) {
+    GVariant* value =
+        g_variant_lookup_value(changed, "Value", G_VARIANT_TYPE("ay"));
+    if (value != nullptr) {
+      gsize length = 0;
+      const auto* data = static_cast<const char*>(
+          g_variant_get_fixed_array(value, &length, sizeof(char)));
+      if (data != nullptr && transport_ != nullptr) {
+        transport_->Receive(std::string(data, length));
+      }
+      g_variant_unref(value);
+    }
+  }
+  g_variant_unref(changed);
+  g_variant_unref(invalidated);
+}
+
+class WeaveBleSocketImpl final : public api::ble::BleSocket {
+ public:
+  WeaveBleSocketImpl(std::shared_ptr<WeaveTransport> transport,
+                     std::shared_ptr<weave::BaseSocket> socket,
+                     std::shared_ptr<WeaveInput> input,
+                     std::shared_ptr<WeaveOutput> output,
+                     BlePeripheral::UniqueId peripheral_id)
+      : transport_(std::move(transport)),
+        socket_(std::move(socket)),
+        input_(std::move(input)),
+        output_(std::move(output)),
+        peripheral_id_(peripheral_id) {}
+
+  InputStream& GetInputStream() override { return *input_; }
+  OutputStream& GetOutputStream() override { return *output_; }
+  Exception Close() override {
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true)) {
+      return {Exception::kSuccess};
+    }
+    input_->Close();
+    output_->Close();
+    if (socket_ != nullptr) socket_->Disconnect();
+    if (transport_ != nullptr) transport_->Close();
+    return {Exception::kSuccess};
+  }
+  BlePeripheral::UniqueId GetRemotePeripheralId() override {
+    return peripheral_id_;
+  }
+
+ private:
+  std::shared_ptr<WeaveTransport> transport_;
+  std::shared_ptr<weave::BaseSocket> socket_;
+  std::shared_ptr<WeaveInput> input_;
+  std::shared_ptr<WeaveOutput> output_;
+  BlePeripheral::UniqueId peripheral_id_;
+  std::atomic_bool closed_{false};
+};
+
+class WeaveServerSocketImpl final : public api::ble::BleServerSocket {
+ public:
+  WeaveServerSocketImpl() {
+    input_ = std::make_shared<WeaveInput>();
+    transport_ = std::make_shared<WeaveServerTransport>();
+    gatt_ = std::make_shared<WeaveGattServer>(
+        [this](std::string data) { transport_->Receive(data); });
+    transport_->set_gatt(gatt_);
+    auto state = this;
+    socket_ = std::make_shared<weave::ServerSocket>(
+        *transport_,
+        weave::SocketCallback{
+            .on_connected_cb = [state]() { state->OnConnected(); },
+            .on_disconnected_cb = [state]() { state->OnDisconnected(); },
+            .on_receive_cb =
+                [input = input_](std::string message) {
+                  input->Push(std::move(message));
+                },
+            .on_error_cb = [](absl::Status status) {
+              LOG(WARNING) << "BLE weave server error: " << status;
+            },
+        });
+    if (!gatt_->Start()) {
+      closed_ = true;
+    }
+  }
+
+  ~WeaveServerSocketImpl() override { Close(); }
+
+  std::unique_ptr<api::ble::BleSocket> Accept() override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [this]() {
+      return closed_ || !pending_.empty();
+    });
+    if (pending_.empty()) return nullptr;
+    auto socket = std::move(pending_.front());
+    pending_.pop_front();
+    return socket;
+  }
+
+  Exception Close() override {
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true)) {
+      return {Exception::kSuccess};
+    }
+    input_->Close();
+    if (transport_ != nullptr) transport_->Close();
+    condition_.notify_all();
+    return {Exception::kSuccess};
+  }
+
+ private:
+  void OnConnected() {
+    auto output = std::make_shared<WeaveOutput>(socket_);
+    auto socket = std::make_unique<WeaveBleSocketImpl>(
+        transport_, socket_, input_, output, 0);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_.push_back(std::move(socket));
+    }
+    condition_.notify_all();
+  }
+
+  void OnDisconnected() {
+    input_->Close();
+    condition_.notify_all();
+  }
+
+  std::shared_ptr<WeaveInput> input_;
+  std::shared_ptr<WeaveServerTransport> transport_;
+  std::shared_ptr<WeaveGattServer> gatt_;
+  std::shared_ptr<weave::ServerSocket> socket_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<std::unique_ptr<api::ble::BleSocket>> pending_;
+  std::atomic_bool closed_{false};
+};
+
+}  // namespace
+
+
+namespace {
+
+struct WeaveHandshakeState {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool connected = false;
+  bool failed = false;
+};
+
+}  // namespace
+
+std::unique_ptr<api::ble::BleServerSocket>
+BleMediumImpl::OpenServerSocket(const std::string& service_id) {
+  return std::make_unique<WeaveServerSocketImpl>();
+}
+
+std::unique_ptr<api::ble::BleSocket> BleMediumImpl::Connect(
+    const std::string& service_id, TxPowerLevel tx_power_level,
+    BlePeripheral::UniqueId peripheral_id,
+    CancellationFlag* cancellation_flag) {
+  if (cancellation_flag != nullptr && cancellation_flag->Cancelled()) {
+    return nullptr;
+  }
+  std::string address;
+  {
+    std::lock_guard<std::mutex> lock(peripherals_mutex_);
+    auto it = id_to_address_.find(peripheral_id);
+    if (it == id_to_address_.end()) return nullptr;
+    address = it->second;
+  }
+  auto client = std::make_shared<WeaveGattClient>(address);
+  if (!client->Connect()) return nullptr;
+  auto transport = std::make_shared<WeaveClientTransport>(client);
+  client->set_transport(transport);
+  auto input = std::make_shared<WeaveInput>();
+  auto state = std::make_shared<WeaveHandshakeState>();
+  auto weave_socket = std::make_shared<weave::ClientSocket>(
+      *transport,
+      weave::SocketCallback{
+          .on_connected_cb =
+              [state]() {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->connected = true;
+                state->condition.notify_all();
+              },
+          .on_disconnected_cb =
+              [state]() {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->failed = true;
+                state->condition.notify_all();
+              },
+          .on_receive_cb =
+              [input](std::string message) { input->Push(std::move(message)); },
+          .on_error_cb =
+              [state](absl::Status status) {
+                LOG(WARNING) << "BLE weave client error: " << status;
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->failed = true;
+                state->condition.notify_all();
+              },
+      });
+  auto output = std::make_shared<WeaveOutput>(weave_socket);
+  auto socket = std::make_unique<WeaveBleSocketImpl>(
+      transport, weave_socket, input, output, peripheral_id);
+  weave_socket->Connect();
+  std::unique_lock<std::mutex> lock(state->mutex);
+  state->condition.wait_for(lock, std::chrono::seconds(5),
+                            [state]() {
+                              return state->connected || state->failed;
+                            });
+  if (!state->connected) {
+    socket->Close();
+    return nullptr;
+  }
+  return socket;
 }
 
 }  // namespace linux_platform
