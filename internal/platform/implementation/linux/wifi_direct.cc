@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -79,6 +80,100 @@ std::string RandomString(int length) {
     result.push_back(kAlphabet[distribution(generator)]);
   }
   return result;
+}
+
+constexpr char kWpaCli[] = "/sbin/wpa_cli";
+constexpr char kP2pDeviceInterface[] = "p2p-dev-wlan0";
+
+std::string Trim(std::string value) {
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.front()))) {
+    value.erase(value.begin());
+  }
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.back()))) {
+    value.pop_back();
+  }
+  return value;
+}
+
+void StripQuotes(std::string* value) {
+  if (value->size() >= 2 && value->front() == '"' && value->back() == '"') {
+    *value = value->substr(1, value->size() - 2);
+  }
+}
+
+std::string WpaCli(const std::string& arguments) {
+  return RunCommandOutput(absl::StrCat(kWpaCli, " ", arguments, " 2>&1"));
+}
+
+bool WpaCliOk(const std::string& arguments) {
+  std::string output = WpaCli(arguments);
+  return output.find("OK") != std::string::npos &&
+         output.find("FAIL") == std::string::npos;
+}
+
+// Returns an empty prefix when running as root. For unprivileged processes,
+// use passwordless sudo if it is available; otherwise the P2P GO path cannot
+// configure its interface and the caller falls back to the NetworkManager
+// hotspot.
+std::string PrivilegedPrefix() {
+  if (geteuid() == 0) return "";
+  static const bool sudo_available =
+      RunCommand("sudo -n true >/dev/null 2>&1");
+  return sudo_available ? "sudo -n " : "";
+}
+
+bool CanConfigureP2pInterface() {
+  return geteuid() == 0 || !PrivilegedPrefix().empty();
+}
+
+std::string LatestP2pInterface() {
+  return Trim(RunCommandOutput(
+      "ls -1 /sys/class/net 2>/dev/null | grep '^p2p-wlan0-' | "
+      "sort -V | tail -1"));
+}
+
+std::string P2pLinkState(const std::string& interface) {
+  return RunCommandOutput(
+      absl::StrCat("/usr/bin/ip -o link show dev ", interface, " 2>/dev/null"));
+}
+
+bool P2pInterfaceIsUp(const std::string& interface) {
+  std::string link = P2pLinkState(interface);
+  return link.find(",UP") != std::string::npos ||
+         link.find("<UP") != std::string::npos;
+}
+
+std::string ReadGroupNetworkValue(const std::string& interface,
+                                  const std::string& key) {
+  std::string value = Trim(WpaCli(absl::StrCat(
+      "-i ", interface, " get_network 0 ", key)));
+  StripQuotes(&value);
+  return value;
+}
+
+// Waits for a P2P group interface to remain up long enough to be usable.
+// Some drivers create the interface and immediately tear the AP down again;
+// treat that as a failure so the caller can use the hotspot fallback.
+bool WaitForP2pGroup(std::string* interface) {
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    std::string candidate = LatestP2pInterface();
+    if (!candidate.empty() && P2pInterfaceIsUp(candidate)) {
+      usleep(1500000);
+      if (candidate != LatestP2pInterface() ||
+          !P2pInterfaceIsUp(candidate)) {
+        continue;
+      }
+      std::string status = WpaCli(absl::StrCat("-i ", candidate, " status"));
+      if (status.find("wpa_state=COMPLETED") != std::string::npos) {
+        *interface = candidate;
+        return true;
+      }
+    }
+    usleep(200000);
+  }
+  return false;
 }
 
 }  // namespace
@@ -182,6 +277,9 @@ bool WifiDirectMediumImpl::IsInterfaceValid() const {
 }
 
 std::string WifiDirectMediumImpl::GetWlanIPv4() const {
+  if (mode_ == Mode::kP2p && !p2p_interface_.empty()) {
+    return gateway_;
+  }
   std::string output = RunCommandOutput(
       absl::StrCat("nmcli -g IP4.ADDRESS device show ", kWlanInterface));
   std::size_t end = output.find_first_of("/\n");
@@ -240,6 +338,92 @@ WifiDirectMediumImpl::ListenForService(int port) {
 bool WifiDirectMediumImpl::StartWifiDirect(
     WifiDirectCredentials* wifi_direct_credentials) {
   if (wifi_direct_credentials == nullptr) return false;
+  StopWifiDirect();
+  if (StartP2p(wifi_direct_credentials)) {
+    mode_ = Mode::kP2p;
+    return true;
+  }
+  StopP2p();
+  if (StartHotspot(wifi_direct_credentials)) {
+    mode_ = Mode::kHotspot;
+    return true;
+  }
+  mode_ = Mode::kNone;
+  return false;
+}
+
+bool WifiDirectMediumImpl::StartP2p(
+    WifiDirectCredentials* wifi_direct_credentials) {
+  if (!CanConfigureP2pInterface()) {
+    LOG(INFO) << "P2P GO needs root or passwordless sudo; falling back to "
+                 "NetworkManager hotspot";
+    return false;
+  }
+  StopP2p();
+
+  const std::string device_name = "Linux Test";
+  WpaCli(absl::StrCat("-i ", kP2pDeviceInterface, " set device_name ",
+                      ShellQuote(device_name)));
+
+  if (!WpaCliOk(absl::StrCat("-i ", kP2pDeviceInterface,
+                             " p2p_group_add freq=2412"))) {
+    LOG(INFO) << "wpa_supplicant refused to start a P2P GO";
+    return false;
+  }
+
+  std::string interface;
+  if (!WaitForP2pGroup(&interface)) {
+    LOG(INFO) << "P2P GO did not stay up";
+    return false;
+  }
+  p2p_interface_ = interface;
+
+  std::string ssid = ReadGroupNetworkValue(interface, "ssid");
+  std::string password = ReadGroupNetworkValue(interface, "psk");
+  if (ssid.empty() || password.empty() || password == "*") {
+    LOG(INFO) << "Could not read P2P group credentials";
+    return false;
+  }
+
+  const std::string prefix = PrivilegedPrefix();
+  RunCommand(absl::StrCat(prefix, "/usr/bin/ip addr flush dev ", interface,
+                          " >/dev/null 2>&1"));
+  if (!RunCommand(absl::StrCat(prefix, "/usr/bin/ip addr add 192.168.49.1/24 "
+                                          "dev ", interface)) ||
+      !RunCommand(absl::StrCat(prefix, "/usr/bin/ip link set ", interface,
+                               " up"))) {
+    LOG(WARNING) << "Could not configure the P2P GO interface";
+    return false;
+  }
+
+  p2p_dnsmasq_pid_ = absl::StrCat(
+      "/tmp/quickshare-p2p-dnsmasq-", getpid(), ".pid");
+  std::string dnsmasq = absl::StrCat(
+      prefix, "/usr/sbin/dnsmasq --interface=", interface,
+      " --bind-interfaces --dhcp-range=192.168.49.2,192.168.49.20,"
+      "255.255.255.0,1h --dhcp-option=3,192.168.49.1 --port=0 "
+      "--pid-file=",
+      p2p_dnsmasq_pid_);
+  if (!RunCommand(dnsmasq)) {
+    LOG(WARNING) << "Could not start DHCP for the P2P GO";
+    return false;
+  }
+
+  ssid_ = ssid;
+  password_ = password;
+  gateway_ = "192.168.49.1";
+  wifi_direct_credentials->SetSSID(ssid_);
+  wifi_direct_credentials->SetPassword(password_);
+  wifi_direct_credentials->SetGateway(gateway_);
+  wifi_direct_credentials->SetFrequency(2412);
+  wifi_direct_credentials->SetDeviceName(device_name);
+  LOG(INFO) << "Started Wi-Fi Direct P2P GO " << ssid_ << " at " << gateway_
+            << " using " << interface;
+  return true;
+}
+
+bool WifiDirectMediumImpl::StartHotspot(
+    WifiDirectCredentials* wifi_direct_credentials) {
   ssid_ = absl::StrCat("DIRECT-qs-", RandomString(4));
   password_ = RandomString(12);
   RunCommand(absl::StrCat("nmcli connection delete ", kHotspotProfile,
@@ -266,14 +450,33 @@ bool WifiDirectMediumImpl::StartWifiDirect(
   return true;
 }
 
+void WifiDirectMediumImpl::StopP2p() {
+  const std::string prefix = PrivilegedPrefix();
+  if (!p2p_dnsmasq_pid_.empty()) {
+    RunCommand(absl::StrCat(prefix, "kill $(cat ",
+                            ShellQuote(p2p_dnsmasq_pid_),
+                            ") >/dev/null 2>&1"));
+    RunCommand(absl::StrCat(prefix, "rm -f ",
+                            ShellQuote(p2p_dnsmasq_pid_)));
+    p2p_dnsmasq_pid_.clear();
+  }
+  if (!p2p_interface_.empty()) {
+    WpaCli(absl::StrCat("-i ", kP2pDeviceInterface, " p2p_group_remove ",
+                        ShellQuote(p2p_interface_)));
+    p2p_interface_.clear();
+  }
+  ssid_.clear();
+  password_.clear();
+  gateway_.clear();
+}
+
 bool WifiDirectMediumImpl::StopWifiDirect() {
+  StopP2p();
   bool result = RunCommand(absl::StrCat("nmcli connection down ",
                                         kHotspotProfile, " >/dev/null 2>&1"));
   RunCommand(absl::StrCat("nmcli connection delete ", kHotspotProfile,
                           " >/dev/null 2>&1"));
-  ssid_.clear();
-  password_.clear();
-  gateway_.clear();
+  mode_ = Mode::kNone;
   return result;
 }
 

@@ -85,6 +85,12 @@ class WifiDirectMediumImpl final : public api::WifiDirectMedium {
   std::string GetWlanIPv4() const;
 
  private:
+  enum class Mode { kNone, kHotspot, kP2p };
+
+  bool StartP2p(WifiDirectCredentials* wifi_direct_credentials);
+  bool StartHotspot(WifiDirectCredentials* wifi_direct_credentials);
+  void StopP2p();
+
   std::string ssid_;
   std::string password_;
   std::string gateway_;
@@ -92,6 +98,9 @@ class WifiDirectMediumImpl final : public api::WifiDirectMedium {
   std::string joined_profile_;
   std::string previous_wifi_;
   std::vector<std::string> disabled_profiles_;
+  Mode mode_ = Mode::kNone;
+  std::string p2p_interface_;
+  std::string p2p_dnsmasq_pid_;
 };
 
 std::unique_ptr<api::WifiDirectMedium> CreateWifiDirectMedium();
