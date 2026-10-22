@@ -568,6 +568,8 @@ void NcRequestConnection(
       connection_options->common_options.allowed_mediums[NC_MEDIUM_WEB_RTC];
   cpp_connection_options.allowed.wifi_lan =
       connection_options->common_options.allowed_mediums[NC_MEDIUM_WIFI_LAN];
+  cpp_connection_options.allowed.wifi_direct =
+      connection_options->common_options.allowed_mediums[NC_MEDIUM_WIFI_DIRECT];
   cpp_connection_options.allowed.wifi_aware_r4 =
       connection_options->common_options
           .allowed_mediums[NC_MEDIUM_WIFI_AWARE] ||
