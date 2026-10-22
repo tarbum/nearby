@@ -1893,11 +1893,20 @@ class WeaveGattClient {
       LOG(WARNING) << "WeaveGattClient device path not found for " << address_;
       return false;
     }
-    bool connected = false;
+    bool connected =
+        GetBoolProperty(BluezConnection::Get()->connection(), device_path_,
+                        "org.bluez.Device1", "Connected")
+            .value_or(false);
     for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
-      connected = CallMethod(BluezConnection::Get()->connection(), device_path_,
-                             "org.bluez.Device1", "Connect", nullptr);
-      if (!connected) usleep(500000);
+      CallMethod(BluezConnection::Get()->connection(), device_path_,
+                 "org.bluez.Device1", "Connect", nullptr);
+      for (int wait = 0; wait < 10 && !connected; ++wait) {
+        usleep(200000);
+        connected = GetBoolProperty(BluezConnection::Get()->connection(),
+                                    device_path_, "org.bluez.Device1",
+                                    "Connected")
+                        .value_or(false);
+      }
     }
     if (!connected) {
       LOG(WARNING) << "BlueZ LE connect failed for " << address_;
