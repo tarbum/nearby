@@ -268,6 +268,7 @@ class FastInitAdvertisement {
  public:
   bool Start(const std::string& endpoint_id) {
     Stop();
+    if (std::getenv("QUICKSHARE_DISABLE_FAST_INIT") != nullptr) return true;
     if (!BluezConnection::Get()->available()) return false;
     GChecksum* checksum = g_checksum_new(G_CHECKSUM_SHA256);
     g_checksum_update(
