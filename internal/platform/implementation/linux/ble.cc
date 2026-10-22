@@ -2010,7 +2010,8 @@ class WeaveGattClient {
     g_variant_iter_init(&iter, objects);
     const gchar* path = nullptr;
     GVariant* interfaces = nullptr;
-    std::string connected_weave_path;
+    std::string named_weave_path;
+    int best_named_rssi = -1000;
     while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
       GVariant* props = g_variant_lookup_value(
           interfaces, "org.bluez.Device1", G_VARIANT_TYPE("a{sv}"));
@@ -2022,43 +2023,90 @@ class WeaveGattClient {
           device_path_ = path;
         }
         if (address != nullptr) g_variant_unref(address);
-        GVariant* connected = g_variant_lookup_value(
-            props, "Connected", G_VARIANT_TYPE_BOOLEAN);
-        bool is_connected =
-            connected != nullptr && g_variant_get_boolean(connected);
-        if (connected != nullptr) g_variant_unref(connected);
-        if (is_connected && connected_weave_path.empty()) {
-          GVariant* uuids = g_variant_lookup_value(
-              props, "UUIDs", G_VARIANT_TYPE("as"));
-          if (uuids != nullptr) {
-            GVariantIter uuid_iter;
-            const gchar* uuid = nullptr;
-            g_variant_iter_init(&uuid_iter, uuids);
-            while (g_variant_iter_next(&uuid_iter, "&s", &uuid)) {
-              if (Lowercase(uuid) == Lowercase(kWeaveServiceUuid)) {
-                connected_weave_path = path;
+
+        bool descriptive_name = false;
+        GVariant* name = g_variant_lookup_value(
+            props, "Name", G_VARIANT_TYPE_STRING);
+        if (name != nullptr) {
+          std::string value = VariantToString(name);
+          descriptive_name = !value.empty() && value.rfind("QS", 0) != 0;
+          g_variant_unref(name);
+        }
+        if (!descriptive_name) {
+          GVariant* alias = g_variant_lookup_value(
+              props, "Alias", G_VARIANT_TYPE_STRING);
+          if (alias != nullptr) {
+            std::string value = VariantToString(alias);
+            bool mac_like = value.size() == 17;
+            for (char c : value) {
+              if (c != '-' && !std::isxdigit(static_cast<unsigned char>(c))) {
+                mac_like = false;
                 break;
               }
             }
-            g_variant_unref(uuids);
+            descriptive_name = !value.empty() && !mac_like &&
+                               value.rfind("QS", 0) != 0;
+            g_variant_unref(alias);
           }
+        }
+        bool has_weave = false;
+        GVariant* uuids = g_variant_lookup_value(
+            props, "UUIDs", G_VARIANT_TYPE("as"));
+        if (uuids != nullptr) {
+          GVariantIter uuid_iter;
+          const gchar* uuid = nullptr;
+          g_variant_iter_init(&uuid_iter, uuids);
+          while (g_variant_iter_next(&uuid_iter, "&s", &uuid)) {
+            if (Lowercase(uuid) == Lowercase(kWeaveServiceUuid)) {
+              has_weave = true;
+              break;
+            }
+          }
+          g_variant_unref(uuids);
+        }
+        if (!has_weave) {
+          GVariant* service_data = g_variant_lookup_value(
+              props, "ServiceData", G_VARIANT_TYPE("a{sv}"));
+          if (service_data != nullptr) {
+            GVariantIter data_iter;
+            const gchar* data_uuid = nullptr;
+            GVariant* data_value = nullptr;
+            g_variant_iter_init(&data_iter, service_data);
+            while (g_variant_iter_next(&data_iter, "{&s@v}", &data_uuid,
+                                       &data_value)) {
+              if (Lowercase(data_uuid) == Lowercase(kWeaveServiceUuid)) {
+                has_weave = true;
+              }
+              g_variant_unref(data_value);
+              if (has_weave) break;
+            }
+            g_variant_unref(service_data);
+          }
+        }
+        int rssi = -1000;
+        GVariant* rssi_value = g_variant_lookup_value(
+            props, "RSSI", G_VARIANT_TYPE_INT16);
+        if (rssi_value != nullptr) {
+          rssi = g_variant_get_int16(rssi_value);
+          g_variant_unref(rssi_value);
+        }
+        if (descriptive_name && has_weave && rssi > best_named_rssi) {
+          best_named_rssi = rssi;
+          named_weave_path = path;
         }
         g_variant_unref(props);
       }
       g_variant_unref(interfaces);
     }
-    if (!device_path_.empty() && !connected_weave_path.empty()) {
-      auto target_connected = GetBoolProperty(
-          BluezConnection::Get()->connection(), device_path_,
-          "org.bluez.Device1", "Connected");
-      if (!target_connected.value_or(false)) {
-        LOG(INFO) << "Using connected BlueZ peer " << connected_weave_path
-                  << " instead of stale advertisement address " << address_;
-        device_path_ = connected_weave_path;
-      }
-    }
     g_variant_unref(objects);
     g_variant_unref(reply);
+
+    if (!device_path_.empty() && !named_weave_path.empty() &&
+        device_path_ != named_weave_path) {
+      LOG(INFO) << "Using named BlueZ peer " << named_weave_path
+                << " instead of stale advertisement address " << address_;
+      device_path_ = named_weave_path;
+    }
     return !device_path_.empty();
   }
 
