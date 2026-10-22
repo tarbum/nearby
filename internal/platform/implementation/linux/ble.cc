@@ -68,7 +68,7 @@ std::mutex g_gatt_slot_mutex;
 constexpr char kAdapterObject[] = "/org/bluez/hci0";
 constexpr char kAdvertisingInterface[] = "org.bluez.LEAdvertisingManager1";
 constexpr char kAdvertisementInterface[] = "org.bluez.LEAdvertisement1";
-constexpr int kDBusTimeoutMs = 3000;
+constexpr int kDBusTimeoutMs = 10000;
 
 std::string VariantToString(GVariant* value) {
   if (value == nullptr) return "";
