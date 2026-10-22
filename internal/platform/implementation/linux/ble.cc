@@ -63,6 +63,8 @@ using ::nearby::api::ble::TxPowerLevel;
 
 constexpr char kBlueZService[] = "org.bluez";
 constexpr char kAdapterInterface[] = "org.bluez.Adapter1";
+std::string g_gatt_slot_value;
+std::mutex g_gatt_slot_mutex;
 constexpr char kAdapterObject[] = "/org/bluez/hci0";
 constexpr char kAdvertisingInterface[] = "org.bluez.LEAdvertisingManager1";
 constexpr char kAdvertisementInterface[] = "org.bluez.LEAdvertisement1";
@@ -1011,6 +1013,14 @@ class BleMediumImpl final : public api::ble::BleMedium {
           "/com/tarbum/quickshare/adv", next_advertisement_id_++);
       advertising_path = advertising_path_;
     }
+    {
+      std::lock_guard<std::mutex> lock{g_gatt_slot_mutex};
+      for (const auto& [uuid, value] : data.service_data) {
+        if (std::string(uuid) == "0000fef3-0000-1000-8000-00805f9b34fb") {
+          g_gatt_slot_value.assign(value.data(), value.size());
+        }
+      }
+    }
 
     static const char kIntrospectionXml[] =
         "<node>"
@@ -1387,6 +1397,10 @@ constexpr char kWeaveToPeripheralUuid[] =
     "00000100-0004-1000-8000-001a11000101";
 constexpr char kWeaveFromPeripheralUuid[] =
     "00000100-0004-1000-8000-001a11000102";
+constexpr char kAdvertisementSlotUuid[] =
+    "00000000-0000-3000-8000-000000000000";
+constexpr char kCccdUuid[] =
+    "00002902-0000-1000-8000-00805f9b34fb";
 constexpr int kWeavePacketSize = 512;
 
 std::string Lowercase(std::string value) {
@@ -1567,6 +1581,10 @@ class WeaveGattServer {
       "/com/tarbum/quickshare/weave/service0/to";
   static constexpr char kFromPath[] =
       "/com/tarbum/quickshare/weave/service0/from";
+  static constexpr char kSlotPath[] =
+      "/com/tarbum/quickshare/weave/service0/slot0";
+  static constexpr char kFromCccdPath[] =
+      "/com/tarbum/quickshare/weave/service0/from/desc";
 
   static void OnMethodCall(GDBusConnection* connection, const gchar* sender,
                            const gchar* object_path,
@@ -1621,6 +1639,17 @@ class WeaveGattServer {
         return;
       }
     }
+    if (std::strcmp(interface_name, "org.bluez.GattDescriptor1") == 0 &&
+        std::strcmp(object_path, kFromCccdPath) == 0 &&
+        std::strcmp(method_name, "WriteValue") == 0) {
+      GVariant* bytes = nullptr;
+      GVariant* options = nullptr;
+      g_variant_get(parameters, "(@ay@a{sv})", &bytes, &options);
+      if (bytes != nullptr) g_variant_unref(bytes);
+      if (options != nullptr) g_variant_unref(options);
+      g_dbus_method_invocation_return_value(invocation, nullptr);
+      return;
+    }
     g_dbus_method_invocation_return_dbus_error(
         invocation, "org.bluez.Error.NotSupported", "Unsupported method");
   }
@@ -1661,16 +1690,31 @@ class WeaveGattServer {
         "<property name='Value' type='ay' access='read'/>"
         "<property name='Notifying' type='b' access='read'/>"
         "</interface></node>";
+    static const char kDescriptorXml[] =
+        "<node><interface name='org.bluez.GattDescriptor1'>"
+        "<method name='ReadValue'><arg type='a{sv}' direction='in'/>"
+        "<arg type='ay' direction='out'/></method>"
+        "<method name='WriteValue'><arg type='ay' direction='in'/>"
+        "<arg type='a{sv}' direction='in'/></method>"
+        "<property name='UUID' type='s' access='read'/>"
+        "<property name='Characteristic' type='o' access='read'/>"
+        "<property name='Flags' type='as' access='read'/>"
+        "<property name='Value' type='ay' access='read'/>"
+        "</interface></node>";
 
     GDBusNodeInfo* app = g_dbus_node_info_new_for_xml(kApplicationXml, nullptr);
     GDBusNodeInfo* service =
         g_dbus_node_info_new_for_xml(kServiceXml, nullptr);
     GDBusNodeInfo* characteristic =
         g_dbus_node_info_new_for_xml(kCharacteristicXml, nullptr);
-    if (app == nullptr || service == nullptr || characteristic == nullptr) {
+    GDBusNodeInfo* descriptor =
+        g_dbus_node_info_new_for_xml(kDescriptorXml, nullptr);
+    if (app == nullptr || service == nullptr || characteristic == nullptr ||
+        descriptor == nullptr) {
       if (app) g_dbus_node_info_unref(app);
       if (service) g_dbus_node_info_unref(service);
       if (characteristic) g_dbus_node_info_unref(characteristic);
+      if (descriptor) g_dbus_node_info_unref(descriptor);
       return false;
     }
     static const GDBusInterfaceVTable app_vtable = {
@@ -1709,10 +1753,22 @@ class WeaveGattServer {
         g_dbus_node_info_lookup_interface(characteristic,
                                           "org.bluez.GattCharacteristic1"),
         &characteristic_vtable, this, nullptr, &error);
+    guint slot_id = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kSlotPath,
+        g_dbus_node_info_lookup_interface(characteristic,
+                                          "org.bluez.GattCharacteristic1"),
+        &characteristic_vtable, this, nullptr, &error);
+    guint descriptor_id = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kFromCccdPath,
+        g_dbus_node_info_lookup_interface(descriptor,
+                                          "org.bluez.GattDescriptor1"),
+        &characteristic_vtable, this, nullptr, &error);
     g_dbus_node_info_unref(app);
     g_dbus_node_info_unref(service);
     g_dbus_node_info_unref(characteristic);
-    if (app_id == 0 || service_id == 0 || to_id == 0 || from_id == 0) {
+    g_dbus_node_info_unref(descriptor);
+    if (app_id == 0 || service_id == 0 || to_id == 0 || from_id == 0 ||
+        slot_id == 0 || descriptor_id == 0) {
       if (error) g_error_free(error);
       return false;
     }
@@ -1733,9 +1789,14 @@ class WeaveGattServer {
                                           to_id);
       g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
                                           from_id);
+      g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
+                                          slot_id);
+      g_dbus_connection_unregister_object(BluezConnection::Get()->connection(),
+                                          descriptor_id);
       return false;
     }
-    registrations_ = {app_id, service_id, to_id, from_id};
+    registrations_ = {app_id, service_id, to_id, from_id, slot_id,
+                      descriptor_id};
     registered_ = true;
     return true;
   }
@@ -1755,6 +1816,7 @@ class WeaveGattServer {
     g_variant_builder_init(&paths, G_VARIANT_TYPE("ao"));
     g_variant_builder_add(&paths, "o", kToPath);
     g_variant_builder_add(&paths, "o", kFromPath);
+    g_variant_builder_add(&paths, "o", kSlotPath);
     g_variant_builder_add(&service_props, "{sv}", "Characteristics",
                           g_variant_builder_end(&paths));
     g_variant_builder_add(&service_interfaces, "{s@a{sv}}",
@@ -1787,10 +1849,69 @@ class WeaveGattServer {
                                 G_VARIANT_TYPE_BYTE, "", 0, 1));
       g_variant_builder_add(&props, "{sv}", "Notifying",
                             g_variant_new_boolean(false));
+      if (std::strcmp(path, kFromPath) == 0) {
+        GVariantBuilder descriptors;
+        g_variant_builder_init(&descriptors, G_VARIANT_TYPE("ao"));
+        g_variant_builder_add(&descriptors, "o", kFromCccdPath);
+        g_variant_builder_add(&props, "{sv}", "Descriptors",
+                              g_variant_builder_end(&descriptors));
+      }
       g_variant_builder_add(&interfaces, "{s@a{sv}}",
                             "org.bluez.GattCharacteristic1",
                             g_variant_builder_end(&props));
       g_variant_builder_add(&objects, "{o@a{sa{sv}}}", path,
+                            g_variant_builder_end(&interfaces));
+    }
+
+    {
+      GVariantBuilder interfaces;
+      g_variant_builder_init(&interfaces, G_VARIANT_TYPE("a{sa{sv}}"));
+      GVariantBuilder props;
+      g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
+      g_variant_builder_add(&props, "{sv}", "UUID",
+                            g_variant_new_string(kAdvertisementSlotUuid));
+      g_variant_builder_add(&props, "{sv}", "Service",
+                            g_variant_new_object_path(kServicePath));
+      GVariantBuilder flags;
+      g_variant_builder_init(&flags, G_VARIANT_TYPE("as"));
+      g_variant_builder_add(&flags, "s", "read");
+      g_variant_builder_add(&props, "{sv}", "Flags",
+                            g_variant_builder_end(&flags));
+      std::lock_guard<std::mutex> slot_lock(g_gatt_slot_mutex);
+      g_variant_builder_add(
+          &props, "{sv}", "Value",
+          g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                    g_gatt_slot_value.data(),
+                                    g_gatt_slot_value.size(), 1));
+      g_variant_builder_add(&interfaces, "{s@a{sv}}",
+                            "org.bluez.GattCharacteristic1",
+                            g_variant_builder_end(&props));
+      g_variant_builder_add(&objects, "{o@a{sa{sv}}}", kSlotPath,
+                            g_variant_builder_end(&interfaces));
+    }
+
+    {
+      GVariantBuilder interfaces;
+      g_variant_builder_init(&interfaces, G_VARIANT_TYPE("a{sa{sv}}"));
+      GVariantBuilder props;
+      g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
+      g_variant_builder_add(&props, "{sv}", "UUID",
+                            g_variant_new_string(kCccdUuid));
+      g_variant_builder_add(&props, "{sv}", "Characteristic",
+                            g_variant_new_object_path(kFromPath));
+      GVariantBuilder flags;
+      g_variant_builder_init(&flags, G_VARIANT_TYPE("as"));
+      g_variant_builder_add(&flags, "s", "read");
+      g_variant_builder_add(&flags, "s", "write");
+      g_variant_builder_add(&props, "{sv}", "Flags",
+                            g_variant_builder_end(&flags));
+      g_variant_builder_add(
+          &props, "{sv}", "Value",
+          g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, "\x02\x00", 2, 1));
+      g_variant_builder_add(&interfaces, "{s@a{sv}}",
+                            "org.bluez.GattDescriptor1",
+                            g_variant_builder_end(&props));
+      g_variant_builder_add(&objects, "{o@a{sa{sv}}}", kFromCccdPath,
                             g_variant_builder_end(&interfaces));
     }
     return g_variant_builder_end(&objects);
@@ -1799,6 +1920,11 @@ class WeaveGattServer {
   std::string ReadValue(const gchar* path) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (std::strcmp(path, kToPath) == 0) return to_value_;
+    if (std::strcmp(path, kSlotPath) == 0) {
+      std::lock_guard<std::mutex> slot_lock(g_gatt_slot_mutex);
+      return g_gatt_slot_value;
+    }
+    if (std::strcmp(path, kFromCccdPath) == 0) return std::string("\x02\x00", 2);
     return from_value_;
   }
 
@@ -1817,10 +1943,32 @@ class WeaveGattServer {
         g_variant_builder_init(&paths, G_VARIANT_TYPE("ao"));
         g_variant_builder_add(&paths, "o", kToPath);
         g_variant_builder_add(&paths, "o", kFromPath);
+        g_variant_builder_add(&paths, "o", kSlotPath);
         return g_variant_builder_end(&paths);
       }
     }
     if (std::strcmp(interface, "org.bluez.GattCharacteristic1") == 0) {
+      if (std::strcmp(path, kSlotPath) == 0) {
+        if (std::strcmp(property, "UUID") == 0) {
+          return g_variant_new_string(kAdvertisementSlotUuid);
+        }
+        if (std::strcmp(property, "Service") == 0) {
+          return g_variant_new_object_path(kServicePath);
+        }
+        if (std::strcmp(property, "Flags") == 0) {
+          GVariantBuilder flags;
+          g_variant_builder_init(&flags, G_VARIANT_TYPE("as"));
+          g_variant_builder_add(&flags, "s", "read");
+          return g_variant_builder_end(&flags);
+        }
+        if (std::strcmp(property, "Value") == 0) {
+          std::lock_guard<std::mutex> slot_lock(g_gatt_slot_mutex);
+          return g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                           g_gatt_slot_value.data(),
+                                           g_gatt_slot_value.size(), 1);
+        }
+        return nullptr;
+      }
       bool is_to = std::strcmp(path, kToPath) == 0;
       if (std::strcmp(property, "UUID") == 0) {
         return g_variant_new_string(is_to ? kWeaveToPeripheralUuid
@@ -1847,6 +1995,18 @@ class WeaveGattServer {
       }
       if (std::strcmp(property, "Notifying") == 0) {
         return g_variant_new_boolean(notifying_);
+      }
+    }
+    if (std::strcmp(interface, "org.bluez.GattDescriptor1") == 0 &&
+        std::strcmp(path, kFromCccdPath) == 0) {
+      if (std::strcmp(property, "UUID") == 0) {
+        return g_variant_new_string(kCccdUuid);
+      }
+      if (std::strcmp(property, "Characteristic") == 0) {
+        return g_variant_new_object_path(kFromPath);
+      }
+      if (std::strcmp(property, "Value") == 0) {
+        return g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, "\x02\x00", 2, 1);
       }
     }
     return nullptr;
