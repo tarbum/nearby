@@ -264,6 +264,137 @@ class BluezConnection {
   std::string adapter_path_ = kAdapterObject;
 };
 
+class FastInitAdvertisement {
+ public:
+  bool Start(const std::string& endpoint_id) {
+    Stop();
+    if (!BluezConnection::Get()->available()) return false;
+    GChecksum* checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    g_checksum_update(
+        checksum, reinterpret_cast<const guchar*>(endpoint_id.data()),
+        endpoint_id.size());
+    guint8 digest[32];
+    gsize digest_size = sizeof(digest);
+    g_checksum_get_digest(checksum, digest, &digest_size);
+    g_checksum_free(checksum);
+
+    guint8 payload[23] = {0xfc, 0x12, 0x8e, 0x00, 0x42, 0, 0, 0,
+                          0,    0,    0,    0,    0,    0, 0, 0,
+                          0,    0,    0,    0,    0,    0, 0};
+    payload[14] = static_cast<guint8>(g_random_int_range(0, 256));
+    for (int i = 0; i < 8; ++i) payload[15 + i] = digest[i];
+    data_.assign(reinterpret_cast<const char*>(payload), sizeof(payload));
+
+    static const char kXml[] =
+        "<node><interface name='org.bluez.LEAdvertisement1'>"
+        "<method name='Release'/>"
+        "<property name='Type' type='s' access='read'/>"
+        "<property name='ServiceUUIDs' type='as' access='read'/>"
+        "<property name='ServiceData' type='a{sv}' access='read'/>"
+        "<property name='Discoverable' type='b' access='read'/>"
+        "<property name='IncludeTxPower' type='b' access='read'/>"
+        "</interface></node>";
+    GDBusNodeInfo* node = g_dbus_node_info_new_for_xml(kXml, nullptr);
+    if (node == nullptr) return false;
+    static const GDBusInterfaceVTable vtable = {
+        .method_call = OnMethodCall,
+        .get_property = OnGetProperty,
+        .set_property = nullptr,
+    };
+    GError* error = nullptr;
+    registration_id_ = g_dbus_connection_register_object(
+        BluezConnection::Get()->connection(), kPath,
+        g_dbus_node_info_lookup_interface(node,
+                                          "org.bluez.LEAdvertisement1"),
+        &vtable, this, nullptr, &error);
+    g_dbus_node_info_unref(node);
+    if (registration_id_ == 0) {
+      if (error != nullptr) g_error_free(error);
+      return false;
+    }
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    bool registered = CallMethod(
+        BluezConnection::Get()->connection(),
+        BluezConnection::Get()->adapter_path(), kAdvertisingInterface,
+        "RegisterAdvertisement",
+        g_variant_new("(o@a{sv})", kPath, g_variant_builder_end(&options)));
+    if (!registered) {
+      g_dbus_connection_unregister_object(
+          BluezConnection::Get()->connection(), registration_id_);
+      registration_id_ = 0;
+      return false;
+    }
+    active_ = true;
+    return true;
+  }
+
+  void Stop() {
+    if (!active_) return;
+    active_ = false;
+    if (BluezConnection::Get()->available()) {
+      CallMethod(BluezConnection::Get()->connection(),
+                 BluezConnection::Get()->adapter_path(), kAdvertisingInterface,
+                 "UnregisterAdvertisement", g_variant_new("(o)", kPath));
+      if (registration_id_ != 0) {
+        g_dbus_connection_unregister_object(
+            BluezConnection::Get()->connection(), registration_id_);
+        registration_id_ = 0;
+      }
+    }
+  }
+
+ private:
+  static constexpr char kPath[] = "/com/tarbum/quickshare/fastinit";
+
+  static void OnMethodCall(GDBusConnection*, const gchar*, const gchar*,
+                           const gchar*, const gchar* method_name, GVariant*,
+                           GDBusMethodInvocation* invocation, gpointer) {
+    if (std::strcmp(method_name, "Release") == 0) {
+      g_dbus_method_invocation_return_value(invocation, nullptr);
+      return;
+    }
+    g_dbus_method_invocation_return_dbus_error(
+        invocation, "org.bluez.Error.NotSupported", "Unsupported method");
+  }
+
+  static GVariant* OnGetProperty(GDBusConnection*, const gchar*, const gchar*,
+                                 const gchar*, const gchar* property_name,
+                                 GError**, gpointer user_data) {
+    auto* self = static_cast<FastInitAdvertisement*>(user_data);
+    if (std::strcmp(property_name, "Type") == 0) {
+      return g_variant_new_string("peripheral");
+    }
+    if (std::strcmp(property_name, "Discoverable") == 0) {
+      return g_variant_new_boolean(false);
+    }
+    if (std::strcmp(property_name, "IncludeTxPower") == 0) {
+      return g_variant_new_boolean(false);
+    }
+    if (std::strcmp(property_name, "ServiceUUIDs") == 0) {
+      GVariantBuilder builder;
+      g_variant_builder_init(&builder, G_VARIANT_TYPE("as"));
+      g_variant_builder_add(&builder, "s",
+                            "0000fe2c-0000-1000-8000-00805f9b34fb");
+      return g_variant_builder_end(&builder);
+    }
+    if (std::strcmp(property_name, "ServiceData") == 0) {
+      GVariantBuilder builder;
+      g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
+      g_variant_builder_add(
+          &builder, "{sv}", "0000fe2c-0000-1000-8000-00805f9b34fb",
+          g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, self->data_.data(),
+                                    self->data_.size(), 1));
+      return g_variant_builder_end(&builder);
+    }
+    return nullptr;
+  }
+
+  std::string data_;
+  guint registration_id_ = 0;
+  bool active_ = false;
+};
+
 class BluetoothAdapterImpl final : public api::BluetoothAdapter {
  public:
   bool SetStatus(Status status) override {
@@ -813,6 +944,7 @@ class BleMediumImpl final : public api::ble::BleMedium {
   }
 
   bool StopAdvertising() override {
+    fast_init_.Stop();
     std::string advertising_path;
     guint registration_id = 0;
     {
@@ -1016,10 +1148,32 @@ class BleMediumImpl final : public api::ble::BleMedium {
     {
       std::lock_guard<std::mutex> lock{g_gatt_slot_mutex};
       for (const auto& [uuid, value] : data.service_data) {
-        if (std::string(uuid) == "0000fef3-0000-1000-8000-00805f9b34fb") {
+        LOG(INFO) << "BLE advertisement service data uuid=" << std::string(uuid)
+                  << " size=" << value.size();
+        if (std::string(uuid) == "0000FEF3-0000-1000-8000-00805F9B34FB") {
           g_gatt_slot_value.assign(value.data(), value.size());
         }
       }
+    }
+    {
+      std::lock_guard<std::mutex> lock{g_gatt_slot_mutex};
+      GVariantBuilder changed;
+      g_variant_builder_init(&changed, G_VARIANT_TYPE("a{sv}"));
+      g_variant_builder_add(
+          &changed, "{sv}", "Value",
+          g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                    g_gatt_slot_value.data(),
+                                    g_gatt_slot_value.size(), 1));
+      GVariantBuilder invalidated;
+      g_variant_builder_init(&invalidated, G_VARIANT_TYPE("as"));
+      g_dbus_connection_emit_signal(
+          BluezConnection::Get()->connection(), nullptr,
+          "/com/tarbum/quickshare/weave/service0/slot0",
+          "org.freedesktop.DBus.Properties", "PropertiesChanged",
+          g_variant_new("(s@a{sv}@as)", "org.bluez.GattCharacteristic1",
+                        g_variant_builder_end(&changed),
+                        g_variant_builder_end(&invalidated)),
+          nullptr);
     }
 
     static const char kIntrospectionXml[] =
@@ -1081,6 +1235,16 @@ class BleMediumImpl final : public api::ble::BleMedium {
     std::lock_guard<std::mutex> lock(advertising_mutex_);
     registration_id_ = registration_id;
     advertising_ = true;
+    std::string endpoint_id;
+    for (const auto& [uuid, value] : data.service_data) {
+      if (std::string(uuid) == "0000FEF3-0000-1000-8000-00805F9B34FB" &&
+          value.size() >= 8) {
+        endpoint_id.assign(value.data() + 4, 4);
+      }
+    }
+    if (!endpoint_id.empty() && !fast_init_.Start(endpoint_id)) {
+      LOG(WARNING) << "Could not start Quick Share FastInit advertisement";
+    }
     return true;
   }
 
@@ -1349,6 +1513,7 @@ class BleMediumImpl final : public api::ble::BleMedium {
   guint added_subscription_ = 0;
   guint changed_subscription_ = 0;
   std::mutex advertising_mutex_;
+  FastInitAdvertisement fast_init_;
   bool advertising_ = false;
   bool advertising_connectable_ = true;
   std::string advertising_path_;
