@@ -72,6 +72,7 @@
 #include "internal/platform/implementation/wifi_lan.h"
 #include "internal/platform/implementation/shared/count_down_latch.h"
 #include "internal/platform/implementation/linux/ble.h"
+#include "internal/platform/implementation/linux/wifi_direct.h"
 #include "internal/platform/implementation/linux/wifi_lan.h"
 #include "internal/platform/implementation/shared/file.h"
 #include "internal/platform/implementation/system_clock.h"
@@ -605,7 +606,7 @@ ImplementationPlatform::CreateWifiHotspotMedium() {
 
 std::unique_ptr<WifiDirectMedium>
 ImplementationPlatform::CreateWifiDirectMedium() {
-  return nullptr;
+  return linux_platform::CreateWifiDirectMedium();
 }
 
 std::unique_ptr<Timer> ImplementationPlatform::CreateTimer() {

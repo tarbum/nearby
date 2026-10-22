@@ -21,10 +21,11 @@ import PackageDescription
 let platformExcludes: [String] = [
   "internal/platform/implementation/apple",
   "connections/implementation/mediums/awdl/awdl.cc",
-  "connections/implementation/mediums/wifi_direct/wifi_direct.cc",
   "connections/implementation/mediums/wifi_aware/wifi_aware.cc",
 ]
-let stubExcludes: [String] = []
+let stubExcludes: [String] = [
+  "connections/implementation/mediums/wifi_direct/wifi_direct_stub.cc",
+]
 #else
 let platformExcludes: [String] = []
 let stubExcludes: [String] = [
