@@ -1,12 +1,20 @@
 #include "internal/platform/implementation/linux/ble.h"
 
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/l2cap.h>
 #include <gio/gio.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cerrno>
 #include <deque>
 #include <tuple>
 #include <condition_variable>
@@ -23,6 +31,7 @@
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "internal/platform/byte_array.h"
@@ -43,6 +52,7 @@ namespace {
 
 using ::nearby::api::ble::AdvertiseParameters;
 using ::nearby::api::ble::BleAdvertisementData;
+using ::nearby::api::ble::BleL2capSocket;
 using ::nearby::api::ble::BlePeripheral;
 using ::nearby::api::ble::ClientGattConnectionCallback;
 using ::nearby::api::ble::GattCharacteristic;
@@ -911,9 +921,12 @@ class BleMediumImpl final : public api::ble::BleMedium {
 
   std::unique_ptr<GattClient> ConnectToGattServer(
       BlePeripheral::UniqueId peripheral_id, TxPowerLevel tx_power_level,
-      ClientGattConnectionCallback callback) override {
-    return nullptr;
-  }
+      ClientGattConnectionCallback callback) override;
+
+  std::unique_ptr<BleL2capSocket> ConnectOverL2cap(
+      int psm, const std::string& service_id, TxPowerLevel tx_power_level,
+      BlePeripheral::UniqueId peripheral_id,
+      CancellationFlag* cancellation_flag) override;
 
   std::unique_ptr<api::ble::BleServerSocket> OpenServerSocket(
       const std::string& service_id) override;
@@ -1112,16 +1125,6 @@ class BleMediumImpl final : public api::ble::BleMedium {
                           g_variant_new_string("le"));
     g_variant_builder_add(&filter, "{sv}", "DuplicateData",
                           g_variant_new_boolean(true));
-    if (!service_uuids.empty()) {
-      GVariantBuilder uuids;
-      g_variant_builder_init(&uuids, G_VARIANT_TYPE("as"));
-      for (const auto& uuid : service_uuids) {
-        std::string text = static_cast<std::string>(uuid);
-        g_variant_builder_add(&uuids, "s", text.c_str());
-      }
-      g_variant_builder_add(&filter, "{sv}", "UUIDs",
-                            g_variant_builder_end(&uuids));
-    }
     bool configured = CallMethod(
         BluezConnection::Get()->connection(),
         BluezConnection::Get()->adapter_path(), kAdapterInterface,
@@ -1215,23 +1218,34 @@ class BleMediumImpl final : public api::ble::BleMedium {
   void ProcessDeviceProperties(const std::string& path, GVariant* properties) {
     GVariant* service_data = g_variant_lookup_value(
         properties, "ServiceData", G_VARIANT_TYPE("a{sv}"));
-    if (service_data == nullptr) return;
 
     BleAdvertisementData advertisement;
     advertisement.is_extended_advertisement = false;
     GVariantIter iter;
-    g_variant_iter_init(&iter, service_data);
     const gchar* uuid_text = nullptr;
     GVariant* value = nullptr;
-    while (g_variant_iter_next(&iter, "{&s@v}", &uuid_text, &value)) {
-      GVariant* bytes = g_variant_get_variant(value);
+    if (service_data != nullptr) {
+      g_variant_iter_init(&iter, service_data);
+    }
+    while (service_data != nullptr &&
+           g_variant_iter_next(&iter, "{&s@v}", &uuid_text, &value)) {
+      GVariant* bytes = nullptr;
+      if (g_variant_is_of_type(value, G_VARIANT_TYPE_VARIANT)) {
+        bytes = g_variant_get_variant(value);
+      } else if (g_variant_is_of_type(value, G_VARIANT_TYPE("ay"))) {
+        bytes = g_variant_ref(value);
+      }
       if (bytes != nullptr &&
           g_variant_is_of_type(bytes, G_VARIANT_TYPE("ay"))) {
         gsize length = 0;
         const auto* data =
             static_cast<const char*>(g_variant_get_fixed_array(
                 bytes, &length, sizeof(char)));
-        auto uuid = Uuid::FromString(uuid_text);
+        std::string text(uuid_text);
+        if (text.size() == 4) {
+          text = "0000" + text + "-0000-1000-8000-00805f9b34fb";
+        }
+        auto uuid = Uuid::FromString(text);
         if (uuid.has_value() && data != nullptr && length > 0) {
           advertisement.service_data.emplace(*uuid,
                                              ByteArray(data, length));
@@ -1240,9 +1254,41 @@ class BleMediumImpl final : public api::ble::BleMedium {
       if (bytes != nullptr) g_variant_unref(bytes);
       g_variant_unref(value);
     }
-    g_variant_unref(service_data);
+    if (service_data != nullptr) g_variant_unref(service_data);
+
+    if (advertisement.service_data.empty()) {
+      GVariant* name_value =
+          g_variant_lookup_value(properties, "Name", G_VARIANT_TYPE_STRING);
+      if (name_value == nullptr) {
+        name_value =
+            g_variant_lookup_value(properties, "Alias", G_VARIANT_TYPE_STRING);
+      }
+      if (name_value != nullptr) {
+        std::string name = VariantToString(name_value);
+        g_variant_unref(name_value);
+        GVariant* address_type = g_variant_lookup_value(
+            properties, "AddressType", G_VARIANT_TYPE_STRING);
+        bool random_address =
+            address_type != nullptr &&
+            VariantToString(address_type) == "random";
+        if (address_type != nullptr) g_variant_unref(address_type);
+        if (random_address && name.rfind("QS", 0) == 0) {
+          while (name.size() % 4 != 0) name.push_back('=');
+          std::string decoded;
+          if (absl::Base64Unescape(name, &decoded) && decoded.size() >= 15 &&
+              (static_cast<unsigned char>(decoded[0]) & 0xE0) == 0x40) {
+            auto uuid = Uuid::FromString("0000fef3-0000-1000-8000-00805f9b34fb");
+            if (uuid.has_value()) {
+              advertisement.service_data.emplace(*uuid, ByteArray(decoded));
+            }
+          }
+        }
+      }
+    }
 
     if (advertisement.service_data.empty()) return;
+    LOG(INFO) << "BLE service data from " << path << " entries="
+              << advertisement.service_data.size();
 
     GVariant* address_value = g_variant_lookup_value(
         properties, "Address", G_VARIANT_TYPE_STRING);
@@ -1269,6 +1315,14 @@ class BleMediumImpl final : public api::ble::BleMedium {
         id_to_address_[id] = address;
       }
     }
+    GVariant* address_type_value = g_variant_lookup_value(
+        properties, "AddressType", G_VARIANT_TYPE_STRING);
+    if (address_type_value != nullptr) {
+      std::string address_type = VariantToString(address_type_value);
+      g_variant_unref(address_type_value);
+      std::lock_guard<std::mutex> lock(peripherals_mutex_);
+      id_to_address_type_[id] = address_type == "random" ? 1 : 0;
+    }
 
     std::shared_ptr<ScanCallback> callback;
     {
@@ -1277,6 +1331,7 @@ class BleMediumImpl final : public api::ble::BleMedium {
       callback = scan_callback_;
     }
     if (callback != nullptr) {
+      LOG(INFO) << "BLE advertisement emitted for " << address;
       callback->advertisement_found_cb(id, std::move(advertisement));
     }
   }
@@ -1302,6 +1357,7 @@ class BleMediumImpl final : public api::ble::BleMedium {
   std::mutex peripherals_mutex_;
   std::unordered_map<std::string, BlePeripheral::UniqueId> address_to_id_;
   std::unordered_map<BlePeripheral::UniqueId, std::string> id_to_address_;
+  std::unordered_map<BlePeripheral::UniqueId, uint8_t> id_to_address_type_;
   BlePeripheral::UniqueId next_peripheral_id_ = 1;
 };
 
@@ -1831,21 +1887,40 @@ class WeaveGattClient {
   ~WeaveGattClient() { Close(); }
 
   bool Connect() {
+    LOG(INFO) << "WeaveGattClient connecting to " << address_;
     if (!BluezConnection::Get()->available()) return false;
-    if (!FindDevicePath()) return false;
-    if (!CallMethod(BluezConnection::Get()->connection(), device_path_,
-                    "org.bluez.Device1", "Connect", nullptr)) {
+    if (!FindDevicePath()) {
+      LOG(WARNING) << "WeaveGattClient device path not found for " << address_;
+      return false;
+    }
+    bool connected = false;
+    for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+      connected = CallMethod(BluezConnection::Get()->connection(), device_path_,
+                             "org.bluez.Device1", "Connect", nullptr);
+      if (!connected) usleep(500000);
+    }
+    if (!connected) {
+      LOG(WARNING) << "BlueZ LE connect failed for " << address_;
       return false;
     }
     for (int attempt = 0; attempt < 50; ++attempt) {
-      if (FindCharacteristics()) {
-        CallMethod(BluezConnection::Get()->connection(), from_path_,
-                   "org.bluez.GattCharacteristic1", "StartNotify", nullptr);
+      auto is_connected = GetBoolProperty(
+          BluezConnection::Get()->connection(), device_path_,
+          "org.bluez.Device1", "Connected");
+      if (is_connected.value_or(false) && FindCharacteristics()) {
+        bool notifying = CallMethod(
+            BluezConnection::Get()->connection(), from_path_,
+            "org.bluez.GattCharacteristic1", "StartNotify", nullptr);
+        if (!notifying) {
+          LOG(WARNING) << "BlueZ StartNotify failed for " << address_;
+          return false;
+        }
         Subscribe();
         return true;
       }
       usleep(100000);
     }
+    LOG(WARNING) << "BlueZ GATT characteristics not found for " << address_;
     return false;
   }
 
@@ -2209,9 +2284,14 @@ std::unique_ptr<api::ble::BleSocket> BleMediumImpl::Connect(
   {
     std::lock_guard<std::mutex> lock(peripherals_mutex_);
     auto it = id_to_address_.find(peripheral_id);
-    if (it == id_to_address_.end()) return nullptr;
+    if (it == id_to_address_.end()) {
+      LOG(WARNING) << "No BLE address for peripheral id " << peripheral_id;
+      return nullptr;
+    }
     address = it->second;
   }
+  LOG(INFO) << "BLE connect peripheral id " << peripheral_id << " address "
+            << address;
   auto client = std::make_shared<WeaveGattClient>(address);
   if (!client->Connect()) return nullptr;
   auto transport = std::make_shared<WeaveClientTransport>(client);
@@ -2257,6 +2337,375 @@ std::unique_ptr<api::ble::BleSocket> BleMediumImpl::Connect(
     return nullptr;
   }
   return socket;
+}
+
+}  // namespace linux_platform
+}  // namespace nearby
+
+namespace nearby {
+namespace linux_platform {
+
+class AdvertisementGattClient final : public GattClient {
+ public:
+  explicit AdvertisementGattClient(std::string address)
+      : address_(std::move(address)) {}
+  ~AdvertisementGattClient() override { Disconnect(); }
+
+  bool DiscoverServiceAndCharacteristics(
+      const Uuid& service_uuid,
+      const std::vector<Uuid>& characteristic_uuids) override {
+    if (!FindDevicePath()) return false;
+    if (!connected_) {
+      if (!CallMethod(BluezConnection::Get()->connection(), device_path_,
+                      "org.bluez.Device1", "Connect", nullptr)) {
+        return false;
+      }
+      connected_ = true;
+    }
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      if (FindCharacteristics(service_uuid)) return true;
+      usleep(100000);
+    }
+    return false;
+  }
+
+  std::optional<GattCharacteristic> GetCharacteristic(
+      const Uuid& service_uuid, const Uuid& characteristic_uuid) override {
+    auto it = characteristics_.find(std::string(characteristic_uuid));
+    if (it == characteristics_.end()) return std::nullopt;
+    return GattCharacteristic{
+        .uuid = characteristic_uuid,
+        .service_uuid = service_uuid,
+        .permission = GattCharacteristic::Permission::kRead,
+        .property = GattCharacteristic::Property::kRead,
+    };
+  }
+
+  std::optional<std::string> ReadCharacteristic(
+      const GattCharacteristic& characteristic) override {
+    auto it = characteristics_.find(std::string(characteristic.uuid));
+    if (it == characteristics_.end()) return std::nullopt;
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    GError* error = nullptr;
+    GVariant* reply = g_dbus_connection_call_sync(
+        BluezConnection::Get()->connection(), kBlueZService, it->second.c_str(),
+        "org.bluez.GattCharacteristic1", "ReadValue",
+        g_variant_new("(@a{sv})", g_variant_builder_end(&options)),
+        G_VARIANT_TYPE("(ay)"), G_DBUS_CALL_FLAGS_NONE, kDBusTimeoutMs,
+        nullptr, &error);
+    if (reply == nullptr) {
+      if (error) g_error_free(error);
+      return std::nullopt;
+    }
+    GVariant* bytes = nullptr;
+    g_variant_get(reply, "(@ay)", &bytes);
+    std::optional<std::string> result;
+    if (bytes != nullptr && g_variant_is_of_type(bytes, G_VARIANT_TYPE("ay"))) {
+      gsize length = 0;
+      const auto* data = static_cast<const char*>(
+          g_variant_get_fixed_array(bytes, &length, sizeof(char)));
+      if (data != nullptr) result = std::string(data, length);
+    }
+    if (bytes != nullptr) g_variant_unref(bytes);
+    g_variant_unref(reply);
+    return result;
+  }
+
+  bool WriteCharacteristic(const GattCharacteristic& characteristic,
+                           absl::string_view value, WriteType type) override {
+    auto it = characteristics_.find(std::string(characteristic.uuid));
+    if (it == characteristics_.end()) return false;
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    return CallMethod(
+        BluezConnection::Get()->connection(), it->second.c_str(),
+        "org.bluez.GattCharacteristic1", "WriteValue",
+        g_variant_new("(@ay@a{sv})",
+                      g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                                value.data(), value.size(), 1),
+                      g_variant_builder_end(&options)));
+  }
+
+  void Disconnect() override {
+    if (connected_ && BluezConnection::Get()->available() &&
+        !device_path_.empty()) {
+      CallMethod(BluezConnection::Get()->connection(), device_path_,
+                 "org.bluez.Device1", "Disconnect", nullptr);
+    }
+    connected_ = false;
+    characteristics_.clear();
+  }
+
+ private:
+  bool FindDevicePath() {
+    if (!BluezConnection::Get()->available()) return false;
+    GError* error = nullptr;
+    GVariant* reply = g_dbus_connection_call_sync(
+        BluezConnection::Get()->connection(), kBlueZService, "/",
+        "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", nullptr,
+        G_VARIANT_TYPE("(a{oa{sa{sv}}})"), G_DBUS_CALL_FLAGS_NONE,
+        kDBusTimeoutMs, nullptr, &error);
+    if (reply == nullptr) {
+      if (error) g_error_free(error);
+      return false;
+    }
+    GVariant* objects = nullptr;
+    g_variant_get(reply, "(@a{oa{sa{sv}}})", &objects);
+    GVariantIter iter;
+    g_variant_iter_init(&iter, objects);
+    const gchar* path = nullptr;
+    GVariant* interfaces = nullptr;
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+      GVariant* props = g_variant_lookup_value(
+          interfaces, "org.bluez.Device1", G_VARIANT_TYPE("a{sv}"));
+      if (props != nullptr) {
+        GVariant* address = g_variant_lookup_value(
+            props, "Address", G_VARIANT_TYPE_STRING);
+        if (address != nullptr &&
+            Lowercase(VariantToString(address)) == Lowercase(address_)) {
+          device_path_ = path;
+          g_variant_unref(address);
+          g_variant_unref(props);
+          g_variant_unref(interfaces);
+          break;
+        }
+        if (address != nullptr) g_variant_unref(address);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    g_variant_unref(objects);
+    g_variant_unref(reply);
+    return !device_path_.empty();
+  }
+
+  bool FindCharacteristics(const Uuid& service_uuid) {
+    GError* error = nullptr;
+    GVariant* reply = g_dbus_connection_call_sync(
+        BluezConnection::Get()->connection(), kBlueZService, "/",
+        "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", nullptr,
+        G_VARIANT_TYPE("(a{oa{sa{sv}}})"), G_DBUS_CALL_FLAGS_NONE,
+        kDBusTimeoutMs, nullptr, &error);
+    if (reply == nullptr) {
+      if (error) g_error_free(error);
+      return false;
+    }
+    GVariant* objects = nullptr;
+    g_variant_get(reply, "(@a{oa{sa{sv}}})", &objects);
+    GVariantIter iter;
+    g_variant_iter_init(&iter, objects);
+    const gchar* path = nullptr;
+    GVariant* interfaces = nullptr;
+    std::string service_path;
+    std::string desired_service = Lowercase(std::string(service_uuid));
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+      GVariant* props = g_variant_lookup_value(
+          interfaces, "org.bluez.GattService1", G_VARIANT_TYPE("a{sv}"));
+      if (props != nullptr) {
+        GVariant* uuid =
+            g_variant_lookup_value(props, "UUID", G_VARIANT_TYPE_STRING);
+        if (uuid != nullptr &&
+            Lowercase(VariantToString(uuid)) == desired_service) {
+          service_path = path;
+          g_variant_unref(uuid);
+          g_variant_unref(props);
+          g_variant_unref(interfaces);
+          break;
+        }
+        if (uuid != nullptr) g_variant_unref(uuid);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    if (service_path.empty()) {
+      g_variant_unref(objects);
+      g_variant_unref(reply);
+      return false;
+    }
+    g_variant_iter_init(&iter, objects);
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+      GVariant* props = g_variant_lookup_value(
+          interfaces, "org.bluez.GattCharacteristic1", G_VARIANT_TYPE("a{sv}"));
+      if (props != nullptr) {
+        GVariant* uuid =
+            g_variant_lookup_value(props, "UUID", G_VARIANT_TYPE_STRING);
+        GVariant* service = g_variant_lookup_value(
+            props, "Service", G_VARIANT_TYPE_OBJECT_PATH);
+        if (uuid != nullptr && service != nullptr &&
+            VariantToString(service) == service_path) {
+          characteristics_[std::string(
+              VariantToString(uuid))] = std::string(path);
+        }
+        if (uuid != nullptr) g_variant_unref(uuid);
+        if (service != nullptr) g_variant_unref(service);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    g_variant_unref(objects);
+    g_variant_unref(reply);
+    return !characteristics_.empty();
+  }
+
+  std::string address_;
+  std::string device_path_;
+  bool connected_ = false;
+  std::unordered_map<std::string, std::string> characteristics_;
+};
+
+std::unique_ptr<GattClient> BleMediumImpl::ConnectToGattServer(
+    BlePeripheral::UniqueId peripheral_id, TxPowerLevel tx_power_level,
+    ClientGattConnectionCallback callback) {
+  std::string address;
+  {
+    std::lock_guard<std::mutex> lock(peripherals_mutex_);
+    auto it = id_to_address_.find(peripheral_id);
+    if (it == id_to_address_.end()) return nullptr;
+    address = it->second;
+  }
+  return std::make_unique<AdvertisementGattClient>(address);
+}
+
+class L2capInputStream final : public InputStream {
+ public:
+  explicit L2capInputStream(int fd) : fd_(fd) {}
+  ExceptionOr<ByteArray> Read(std::int64_t size) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (buffer_.empty()) {
+      char temp[8192];
+      ssize_t received = recv(fd_, temp, sizeof(temp), 0);
+      if (received <= 0) return ExceptionOr<ByteArray>{Exception::kIo};
+      buffer_.assign(temp, static_cast<size_t>(received));
+    }
+    size_t count = size < 0 ? buffer_.size() : std::min<size_t>(size, buffer_.size());
+    std::string result = buffer_.substr(0, count);
+    buffer_.erase(0, count);
+    return ExceptionOr<ByteArray>{ByteArray(std::move(result))};
+  }
+  Exception Close() override { return {Exception::kSuccess}; }
+ private:
+  int fd_;
+  std::mutex mutex_;
+  std::string buffer_;
+};
+
+class L2capOutputStream final : public OutputStream {
+ public:
+  explicit L2capOutputStream(int fd) : fd_(fd) {}
+  Exception Write(absl::string_view data) override {
+    size_t offset = 0;
+    while (offset < data.size()) {
+      size_t chunk = std::min<size_t>(data.size() - offset, 16384);
+      ssize_t sent = send(fd_, data.data() + offset, chunk, 0);
+      if (sent <= 0) return {Exception::kIo};
+      offset += static_cast<size_t>(sent);
+    }
+    return {Exception::kSuccess};
+  }
+  Exception Flush() override { return {Exception::kSuccess}; }
+  Exception Close() override { return {Exception::kSuccess}; }
+ private:
+  int fd_;
+};
+
+class L2capSocketImpl final : public BleL2capSocket {
+ public:
+  L2capSocketImpl(int fd, BlePeripheral::UniqueId peripheral_id)
+      : fd_(fd), input_(fd), output_(fd), peripheral_id_(peripheral_id) {}
+  ~L2capSocketImpl() override { Close(); }
+  InputStream& GetInputStream() override { return input_; }
+  OutputStream& GetOutputStream() override { return output_; }
+  Exception Close() override {
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true)) {
+      return {Exception::kSuccess};
+    }
+    shutdown(fd_, SHUT_RDWR);
+    close(fd_);
+    if (notifier_) {
+      auto notifier = std::move(notifier_);
+      notifier();
+    }
+    return {Exception::kSuccess};
+  }
+  void SetCloseNotifier(absl::AnyInvocable<void()> notifier) override {
+    notifier_ = std::move(notifier);
+  }
+  BlePeripheral::UniqueId GetRemotePeripheralId() override {
+    return peripheral_id_;
+  }
+ private:
+  int fd_;
+  L2capInputStream input_;
+  L2capOutputStream output_;
+  BlePeripheral::UniqueId peripheral_id_;
+  std::atomic_bool closed_{false};
+  absl::AnyInvocable<void()> notifier_;
+};
+
+std::unique_ptr<BleL2capSocket> BleMediumImpl::ConnectOverL2cap(
+    int psm, const std::string& service_id, TxPowerLevel tx_power_level,
+    BlePeripheral::UniqueId peripheral_id,
+    CancellationFlag* cancellation_flag) {
+  if (cancellation_flag != nullptr && cancellation_flag->Cancelled()) {
+    return nullptr;
+  }
+  std::string address;
+  uint8_t address_type = 0;
+  {
+    std::lock_guard<std::mutex> lock(peripherals_mutex_);
+    auto it = id_to_address_.find(peripheral_id);
+    if (it == id_to_address_.end()) return nullptr;
+    address = it->second;
+    auto type_it = id_to_address_type_.find(peripheral_id);
+    if (type_it != id_to_address_type_.end()) address_type = type_it->second;
+  }
+  unsigned int values[6];
+  if (sscanf(address.c_str(), "%x:%x:%x:%x:%x:%x", &values[0], &values[1],
+             &values[2], &values[3], &values[4], &values[5]) != 6) {
+    return nullptr;
+  }
+  LOG(INFO) << "L2CAP connecting to " << address << " psm " << psm
+            << " type " << static_cast<int>(address_type);
+  for (int attempt_psm : {psm, psm + 1}) {
+    int fd = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+    if (fd < 0) return nullptr;
+    sockaddr_l2 remote{};
+    remote.l2_family = AF_BLUETOOTH;
+    remote.l2_psm = htobs(attempt_psm);
+    remote.l2_bdaddr_type = address_type;
+    for (int i = 0; i < 6; ++i) {
+      remote.l2_bdaddr.b[i] = static_cast<uint8_t>(values[5 - i]);
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int result =
+        connect(fd, reinterpret_cast<sockaddr*>(&remote), sizeof(remote));
+    if (result < 0 && errno == EINPROGRESS) {
+      pollfd pfd{fd, POLLOUT, 0};
+      result = poll(&pfd, 1, 3000);
+      if (result > 0) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length);
+        result = error == 0 ? 0 : -1;
+        errno = error;
+      } else {
+        result = -1;
+        errno = ETIMEDOUT;
+      }
+    }
+    fcntl(fd, F_SETFL, flags);
+    if (result == 0) {
+      LOG(INFO) << "L2CAP connected to " << address << " psm " << attempt_psm;
+      return std::make_unique<L2capSocketImpl>(fd, peripheral_id);
+    }
+    LOG(WARNING) << "L2CAP connect psm " << attempt_psm << " failed: "
+                 << strerror(errno);
+    close(fd);
+  }
+  return nullptr;
 }
 
 }  // namespace linux_platform

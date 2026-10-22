@@ -2481,8 +2481,7 @@ BasePcpHandler::ConnectImplResult P2pClusterPcpHandler::BleConnectImpl(
   std::shared_ptr<CancellationFlag> cancellation_flag =
       client->GetCancellationFlag(endpoint->endpoint_id);
 
-  if (NearbyFlags::GetInstance().GetBoolFlag(
-          config_package_nearby::nearby_connections_feature::kEnableBleL2cap) &&
+  if (refactor_ble_l2cap &&
       peripheral.GetPsm() !=
           mediums::BleAdvertisementHeader::kDefaultPsmValue) {
     if (refactor_ble_l2cap) {
