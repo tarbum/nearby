@@ -1675,8 +1675,24 @@ std::vector<Medium> BwuManager::StripOutUnavailableMediums(
 Medium BwuManager::ChooseBestUpgradeMedium(
     ClientProxy* client, const std::string& endpoint_id,
     const std::vector<Medium>& mediums) const {
+  std::string requested;
+  for (Medium medium : mediums) {
+    absl::StrAppend(&requested,
+                    location::nearby::proto::connections::Medium_Name(medium),
+                    "; ");
+  }
   auto available_mediums =
       StripOutUnavailableMediums(client, endpoint_id, mediums);
+  std::string available;
+  for (Medium medium : available_mediums) {
+    absl::StrAppend(&available,
+                    location::nearby::proto::connections::Medium_Name(medium),
+                    "; ");
+  }
+  LOG(INFO) << "BwuManager upgrade candidates for endpoint " << endpoint_id
+            << ": requested={" << requested << "} available={" << available
+            << "} go=" << mediums_->GetWifiDirect().IsGOAvailable()
+            << " gc=" << mediums_->GetWifiDirect().IsGCAvailable();
   Medium current_medium = GetBwuMediumForEndpoint(endpoint_id);
   if (current_medium == Medium::UNKNOWN_MEDIUM) {
     if (!available_mediums.empty()) {
@@ -1886,6 +1902,18 @@ void BwuManager::ProcessUpgradePathRequest(
 
   const location::nearby::connections::MediumRole local_medium_role =
       GetLocalMediumRole(client);
+  for (auto m : request.mediums()) {
+    if (parser::UpgradePathInfoMediumToMedium(
+            static_cast<BandwidthUpgradeNegotiationFrame::UpgradePathInfo::
+                            Medium>(m)) == Medium::WIFI_DIRECT) {
+      LOG(INFO) << "BwuManager: accepting incoming WIFI_DIRECT host request "
+                   "for endpoint "
+                << endpoint_id;
+      InitiateBwuForEndpoint(client, endpoint_id, Medium::WIFI_DIRECT,
+                             /*allow_role_switch=*/false);
+      return;
+    }
+  }
   BooleanMediumSelector hostable_mediums;
   for (auto m : request.mediums()) {
     Medium medium = parser::UpgradePathInfoMediumToMedium(
@@ -1936,8 +1964,8 @@ bool BwuManager::CanHost(
     Medium medium) const {
   switch (medium) {
     case Medium::WIFI_DIRECT:
-      return local_medium_role.support_wifi_direct_group_owner() &&
-             remote_medium_role.support_wifi_direct_group_client();
+      return mediums_->GetWifiDirect().IsGOAvailable() ||
+             local_medium_role.support_wifi_direct_group_owner();
     case Medium::WIFI_HOTSPOT:
       return local_medium_role.support_wifi_hotspot_host() &&
              remote_medium_role.support_wifi_hotspot_client();

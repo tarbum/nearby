@@ -910,6 +910,20 @@ ConnectionInfo BasePcpHandler::FillConnectionInfo(
   connection_info.local_endpoint_id = client->GetLocalEndpointId();
   connection_info.local_endpoint_info = info.endpoint_info;
   connection_info.nonce = Prng().NextInt32();
+  if (NearbyFlags::GetInstance().GetBoolFlag(
+          config_package_nearby::nearby_connections_feature::
+              kEnableDynamicRoleSwitch)) {
+    LOG(INFO) << "kEnableDynamicRoleSwitch is enabled";
+    auto medium_role = bwu_manager_->GetLocalMediumRole(client);
+    if (mediums_->GetWifiDirect().IsGOAvailable()) {
+      medium_role.set_support_wifi_direct_group_owner(true);
+    }
+    if (mediums_->GetWifiDirect().IsGCAvailable()) {
+      medium_role.set_support_wifi_direct_group_client(true);
+    }
+    LOG(INFO) << "Advertised medium_role: " << medium_role.DebugString();
+    connection_info.medium_role.emplace(medium_role);
+  }
   if (mediums_->GetWifi().IsAvailable()) {
     connection_info.supports_5_ghz =
         mediums_->GetWifi().GetCapability().supports_5_ghz;
@@ -917,13 +931,6 @@ ConnectionInfo BasePcpHandler::FillConnectionInfo(
     api::WifiInformation& wifi_info = mediums_->GetWifi().GetInformation();
     connection_info.bssid = wifi_info.bssid;
     connection_info.ap_frequency = wifi_info.ap_frequency;
-    if (NearbyFlags::GetInstance().GetBoolFlag(
-            config_package_nearby::nearby_connections_feature::
-                kEnableDynamicRoleSwitch)) {
-      LOG(INFO) << "kEnableDynamicRoleSwitch is enabled";
-      connection_info.medium_role.emplace(
-          bwu_manager_->GetLocalMediumRole(client));
-    }
     LOG(INFO) << "Query for WIFI information: is_supports_5_ghz="
               << connection_info.supports_5_ghz
               << "; bssid=" << connection_info.bssid
