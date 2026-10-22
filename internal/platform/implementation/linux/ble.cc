@@ -1898,9 +1898,6 @@ class WeaveGattClient {
                         "org.bluez.Device1", "Connected")
             .value_or(false);
     if (!connected) {
-      CallMethod(BluezConnection::Get()->connection(), device_path_,
-                 "org.bluez.Device1", "Disconnect", nullptr);
-      usleep(300000);
       for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
         CallMethod(BluezConnection::Get()->connection(), device_path_,
                    "org.bluez.Device1", "Connect", nullptr);
@@ -1917,11 +1914,15 @@ class WeaveGattClient {
       LOG(WARNING) << "BlueZ LE connect failed for " << address_;
       return false;
     }
-    for (int attempt = 0; attempt < 50; ++attempt) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
       auto is_connected = GetBoolProperty(
           BluezConnection::Get()->connection(), device_path_,
           "org.bluez.Device1", "Connected");
-      if (is_connected.value_or(false) && FindCharacteristics()) {
+      auto services_resolved = GetBoolProperty(
+          BluezConnection::Get()->connection(), device_path_,
+          "org.bluez.Device1", "ServicesResolved");
+      if (is_connected.value_or(false) &&
+          services_resolved.value_or(false) && FindCharacteristics()) {
         bool notifying = CallMethod(
             BluezConnection::Get()->connection(), from_path_,
             "org.bluez.GattCharacteristic1", "StartNotify", nullptr);
@@ -2101,11 +2102,8 @@ class WeaveGattClient {
     g_variant_unref(objects);
     g_variant_unref(reply);
 
-    if (!device_path_.empty() && !named_weave_path.empty() &&
-        device_path_ != named_weave_path) {
-      LOG(INFO) << "Using named BlueZ peer " << named_weave_path
-                << " instead of stale advertisement address " << address_;
-      device_path_ = named_weave_path;
+    if (!device_path_.empty()) {
+      LOG(INFO) << "Using BlueZ peer " << device_path_ << " for " << address_;
     }
     return !device_path_.empty();
   }
@@ -2134,7 +2132,10 @@ class WeaveGattClient {
       if (props != nullptr) {
         GVariant* uuid = g_variant_lookup_value(
             props, "UUID", G_VARIANT_TYPE_STRING);
-        if (uuid != nullptr &&
+        bool matching_device =
+            path != nullptr &&
+            std::string(path).rfind(device_path_ + "/", 0) == 0;
+        if (uuid != nullptr && matching_device &&
             Lowercase(VariantToString(uuid)) == Lowercase(kWeaveServiceUuid)) {
           services.push_back(path);
         }
@@ -2386,8 +2387,16 @@ std::unique_ptr<api::ble::BleSocket> BleMediumImpl::Connect(
   }
   LOG(INFO) << "BLE connect peripheral id " << peripheral_id << " address "
             << address;
+  CallMethod(BluezConnection::Get()->connection(),
+             BluezConnection::Get()->adapter_path(), kAdapterInterface,
+             "StopDiscovery", nullptr);
+  usleep(300000);
   auto client = std::make_shared<WeaveGattClient>(address);
-  if (!client->Connect()) return nullptr;
+  bool connected = client->Connect();
+  CallMethod(BluezConnection::Get()->connection(),
+             BluezConnection::Get()->adapter_path(), kAdapterInterface,
+             "StartDiscovery", nullptr);
+  if (!connected) return nullptr;
   auto transport = std::make_shared<WeaveClientTransport>(client);
   client->set_transport(transport);
   auto input = std::make_shared<WeaveInput>();
