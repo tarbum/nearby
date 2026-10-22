@@ -186,8 +186,53 @@ class BluezConnection {
   }
 
   GDBusConnection* connection() const { return connection_; }
+  GMainContext* context() const { return context_; }
   const std::string& adapter_path() const { return adapter_path_; }
   bool available() const { return connection_ != nullptr; }
+
+  // Runs |fn| on the thread that owns the BlueZ main context and waits for
+  // it to finish.  g_dbus_connection_register_object() and
+  // g_dbus_connection_signal_subscribe() bind their callbacks to the
+  // thread-default main context of the calling thread.  Nearby calls them
+  // from worker threads, which would bind them to the global default
+  // context (only iterated by GTK in GUI mode).  Running them on the BlueZ
+  // loop thread binds them to the context that is actually iterated in
+  // headless mode.
+  void RunOnLoopThreadSync(std::function<void()> fn) {
+    if (context_ == nullptr) {
+      fn();
+      return;
+    }
+    if (g_main_context_is_owner(context_)) {
+      fn();
+      return;
+    }
+    struct Task {
+      std::function<void()> fn;
+      std::mutex mutex;
+      std::condition_variable condition;
+      bool done = false;
+    };
+    auto task = std::make_shared<Task>();
+    task->fn = std::move(fn);
+    auto* task_ptr = new std::shared_ptr<Task>(task);
+    g_main_context_invoke_full(
+        context_, G_PRIORITY_DEFAULT,
+        [](gpointer data) -> gboolean {
+          auto task = *static_cast<std::shared_ptr<Task>*>(data);
+          task->fn();
+          {
+            std::lock_guard<std::mutex> lock(task->mutex);
+            task->done = true;
+          }
+          task->condition.notify_all();
+          return G_SOURCE_REMOVE;
+        },
+        task_ptr,
+        [](gpointer data) { delete static_cast<std::shared_ptr<Task>*>(data); });
+    std::unique_lock<std::mutex> lock(task->mutex);
+    task->condition.wait(lock, [&task]() { return task->done; });
+  }
 
  private:
   BluezConnection() {
@@ -208,7 +253,16 @@ class BluezConnection {
     }
 
     loop_ = g_main_loop_new(context_, FALSE);
-    thread_ = std::thread([this]() { g_main_loop_run(loop_); });
+    thread_ = std::thread([this]() {
+      // g_main_loop_run() makes the thread the owner of the context but does
+      // not make it the thread-default.  Exported D-Bus objects and signal
+      // subscriptions capture the thread-default context of the thread that
+      // creates them, so set it here; otherwise they attach to the global
+      // default context, which is not iterated in headless mode.
+      g_main_context_push_thread_default(context_);
+      g_main_loop_run(loop_);
+      g_main_context_pop_thread_default(context_);
+    });
     adapter_path_ = FindAdapterPath();
   }
 
@@ -303,11 +357,13 @@ class FastInitAdvertisement {
         .set_property = nullptr,
     };
     GError* error = nullptr;
-    registration_id_ = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), kPath,
-        g_dbus_node_info_lookup_interface(node,
-                                          "org.bluez.LEAdvertisement1"),
-        &vtable, this, nullptr, &error);
+    BluezConnection::Get()->RunOnLoopThreadSync([&]() {
+      registration_id_ = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), kPath,
+          g_dbus_node_info_lookup_interface(node,
+                                            "org.bluez.LEAdvertisement1"),
+          &vtable, this, nullptr, &error);
+    });
     g_dbus_node_info_unref(node);
     if (registration_id_ == 0) {
       if (error != nullptr) g_error_free(error);
@@ -645,35 +701,37 @@ class GattServerImpl final : public GattServer {
     };
 
     GError* error = nullptr;
-    guint app_registration = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), "/com/tarbum/quickshare/gatt",
-        g_dbus_node_info_lookup_interface(app_node,
-                                          "org.freedesktop.DBus.ObjectManager"),
-        &app_vtable, this, nullptr, &error);
-    if (app_registration == 0) {
-      if (error != nullptr) g_error_free(error);
-      g_dbus_node_info_unref(app_node);
-      g_dbus_node_info_unref(service_node);
-      g_dbus_node_info_unref(char_node);
-      return false;
-    }
-    guint service_registration = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), service_path.c_str(),
-        g_dbus_node_info_lookup_interface(service_node,
-                                          "org.bluez.GattService1"),
-        &service_vtable, this, nullptr, &error);
+    guint app_registration = 0;
+    guint service_registration = 0;
     std::vector<guint> char_registrations;
-    for (const auto& entry : entries) {
-      guint registration = g_dbus_connection_register_object(
-          BluezConnection::Get()->connection(), entry.path.c_str(),
-          g_dbus_node_info_lookup_interface(char_node,
-                                            "org.bluez.GattCharacteristic1"),
-          &char_vtable, this, nullptr, &error);
-      if (registration != 0) char_registrations.push_back(registration);
-    }
+    BluezConnection::Get()->RunOnLoopThreadSync([&]() {
+      app_registration = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), "/com/tarbum/quickshare/gatt",
+          g_dbus_node_info_lookup_interface(
+              app_node, "org.freedesktop.DBus.ObjectManager"),
+          &app_vtable, this, nullptr, &error);
+      if (app_registration == 0) return;
+      service_registration = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), service_path.c_str(),
+          g_dbus_node_info_lookup_interface(service_node,
+                                            "org.bluez.GattService1"),
+          &service_vtable, this, nullptr, &error);
+      for (const auto& entry : entries) {
+        guint registration = g_dbus_connection_register_object(
+            BluezConnection::Get()->connection(), entry.path.c_str(),
+            g_dbus_node_info_lookup_interface(
+                char_node, "org.bluez.GattCharacteristic1"),
+            &char_vtable, this, nullptr, &error);
+        if (registration != 0) char_registrations.push_back(registration);
+      }
+    });
     g_dbus_node_info_unref(app_node);
     g_dbus_node_info_unref(service_node);
     g_dbus_node_info_unref(char_node);
+    if (app_registration == 0) {
+      if (error != nullptr) g_error_free(error);
+      return false;
+    }
 
     GVariantBuilder options;
     g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
@@ -1225,9 +1283,11 @@ class BleMediumImpl final : public api::ble::BleMedium {
         .set_property = nullptr,
     };
     GError* error = nullptr;
-    registration_id = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), advertising_path.c_str(), interface,
-        &vtable, this, nullptr, &error);
+    BluezConnection::Get()->RunOnLoopThreadSync([&]() {
+      registration_id = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), advertising_path.c_str(),
+          interface, &vtable, this, nullptr, &error);
+    });
     g_dbus_node_info_unref(node);
     if (registration_id == 0) {
       if (error != nullptr) {
@@ -1255,14 +1315,16 @@ class BleMediumImpl final : public api::ble::BleMedium {
       advertising_path_.clear();
       return false;
     }
-    std::lock_guard<std::mutex> lock(advertising_mutex_);
-    registration_id_ = registration_id;
-    advertising_ = true;
     std::string endpoint_id;
-    for (const auto& [uuid, value] : data.service_data) {
-      if (std::string(uuid) == "0000FEF3-0000-1000-8000-00805F9B34FB" &&
-          value.size() >= 8) {
-        endpoint_id.assign(value.data() + 4, 4);
+    {
+      std::lock_guard<std::mutex> lock(advertising_mutex_);
+      registration_id_ = registration_id;
+      advertising_ = true;
+      for (const auto& [uuid, value] : data.service_data) {
+        if (std::string(uuid) == "0000FEF3-0000-1000-8000-00805F9B34FB" &&
+            value.size() >= 8) {
+          endpoint_id.assign(value.data() + 4, 4);
+        }
       }
     }
     if (!endpoint_id.empty() && !fast_init_.Start(endpoint_id)) {
@@ -1923,31 +1985,38 @@ class WeaveGattServer {
         .set_property = nullptr,
     };
     GError* error = nullptr;
-    guint app_id = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), kApplicationPath,
-        g_dbus_node_info_lookup_interface(app,
-                                          "org.freedesktop.DBus.ObjectManager"),
-        &app_vtable, this, nullptr, &error);
-    guint service_id = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), kServicePath,
-        g_dbus_node_info_lookup_interface(service,
-                                          "org.bluez.GattService1"),
-        &service_vtable, this, nullptr, &error);
-    guint to_id = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), kToPath,
-        g_dbus_node_info_lookup_interface(characteristic,
-                                          "org.bluez.GattCharacteristic1"),
-        &characteristic_vtable, this, nullptr, &error);
-    guint from_id = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), kFromPath,
-        g_dbus_node_info_lookup_interface(characteristic,
-                                          "org.bluez.GattCharacteristic1"),
-        &characteristic_vtable, this, nullptr, &error);
-    guint descriptor_id = g_dbus_connection_register_object(
-        BluezConnection::Get()->connection(), kFromCccdPath,
-        g_dbus_node_info_lookup_interface(descriptor,
-                                          "org.bluez.GattDescriptor1"),
-        &characteristic_vtable, this, nullptr, &error);
+    guint app_id = 0;
+    guint service_id = 0;
+    guint to_id = 0;
+    guint from_id = 0;
+    guint descriptor_id = 0;
+    BluezConnection::Get()->RunOnLoopThreadSync([&]() {
+      app_id = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), kApplicationPath,
+          g_dbus_node_info_lookup_interface(
+              app, "org.freedesktop.DBus.ObjectManager"),
+          &app_vtable, this, nullptr, &error);
+      service_id = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), kServicePath,
+          g_dbus_node_info_lookup_interface(service,
+                                            "org.bluez.GattService1"),
+          &service_vtable, this, nullptr, &error);
+      to_id = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), kToPath,
+          g_dbus_node_info_lookup_interface(characteristic,
+                                            "org.bluez.GattCharacteristic1"),
+          &characteristic_vtable, this, nullptr, &error);
+      from_id = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), kFromPath,
+          g_dbus_node_info_lookup_interface(characteristic,
+                                            "org.bluez.GattCharacteristic1"),
+          &characteristic_vtable, this, nullptr, &error);
+      descriptor_id = g_dbus_connection_register_object(
+          BluezConnection::Get()->connection(), kFromCccdPath,
+          g_dbus_node_info_lookup_interface(descriptor,
+                                            "org.bluez.GattDescriptor1"),
+          &characteristic_vtable, this, nullptr, &error);
+    });
     g_dbus_node_info_unref(app);
     g_dbus_node_info_unref(service);
     g_dbus_node_info_unref(characteristic);
@@ -2276,10 +2345,13 @@ class WeaveGattClient {
                                GVariant* parameters);
 
   void Subscribe() {
-    subscription_ = g_dbus_connection_signal_subscribe(
-        BluezConnection::Get()->connection(), nullptr,
-        "org.freedesktop.DBus.Properties", "PropertiesChanged", nullptr, nullptr,
-        G_DBUS_SIGNAL_FLAGS_NONE, OnPropertiesChanged, this, nullptr);
+    BluezConnection::Get()->RunOnLoopThreadSync([&]() {
+      subscription_ = g_dbus_connection_signal_subscribe(
+          BluezConnection::Get()->connection(), nullptr,
+          "org.freedesktop.DBus.Properties", "PropertiesChanged", nullptr,
+          nullptr, G_DBUS_SIGNAL_FLAGS_NONE, OnPropertiesChanged, this,
+          nullptr);
+    });
   }
 
   bool FindDevicePath() {
