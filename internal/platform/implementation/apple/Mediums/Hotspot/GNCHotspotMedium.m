@@ -78,6 +78,9 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
   if (self) {
     _hotspot_queue = queue;
     _locationManager = [[CLLocationManager alloc] init];
+    if (@available(macOS 11.0, *)) {
+      [_locationManager requestWhenInUseAuthorization];
+    }
     _nwFramework = nwFramework;
   }
   return self;
@@ -171,8 +174,7 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
                              status == kCLAuthorizationStatusAuthorizedWhenInUse);
 #endif
   if (!locationAuthorized) {
-    GNCLoggerError(@"Location access permission is not granted, skipping to connect to Hotspot.");
-    return NO;
+    GNCLoggerError(@"Location access permission is not granted; attempting association anyway.");
   }
 
   CWInterface *wifiInterface = [CWWiFiClient sharedWiFiClient].interface;
@@ -198,6 +200,23 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
                      scanAttempt, error);
       continue;
     }
+    if (networks.count == 0) {
+      NSError *allScanError = nil;
+      NSSet<CWNetwork *> *allNetworks =
+          [wifiInterface scanForNetworksWithSSID:nil error:&allScanError];
+      if (!allNetworks) {
+        GNCLoggerError(@"Failed to scan all networks (attempt %d): %@",
+                       scanAttempt, allScanError);
+        continue;
+      }
+      NSMutableSet<CWNetwork *> *matching = [NSMutableSet set];
+      for (CWNetwork *network in allNetworks) {
+        if ([network.ssid isEqualToString:ssid]) {
+          [matching addObject:network];
+        }
+      }
+      networks = matching;
+    }
     for (CWNetwork *network in networks) {
       if (bestNetwork == nil ||
           network.rssiValue > bestNetwork.rssiValue) {
@@ -211,6 +230,8 @@ static const UInt8 kConnectionToHostTimeoutInSeconds = 10;
     return NO;
   }
 
+  [wifiInterface disassociate];
+  [NSThread sleepForTimeInterval:0.5];
   for (int i = 0; i < kMaxRetryCount; ++i) {
     BOOL success = [wifiInterface associateToNetwork:bestNetwork password:password error:&error];
 
