@@ -1125,6 +1125,26 @@ class BleMediumImpl final : public api::ble::BleMedium {
         invocation, "org.bluez.Error.NotSupported", "Unsupported method");
   }
 
+  bool PulseAdvertising() {
+    BleAdvertisementData data;
+    AdvertiseParameters parameters;
+    {
+      std::lock_guard<std::mutex> lock(advertising_mutex_);
+      if (!advertising_data_.service_data.empty()) {
+        data = advertising_data_;
+      } else {
+        data = saved_advertising_data_;
+      }
+      if (data.service_data.empty()) return false;
+      parameters = advertising_parameters_;
+    }
+    StopAdvertising();
+    bool started = StartAdvertisingInternal(data, parameters);
+    LOG(INFO) << "BLE FastInit pulse advertising " << (started ? "started" : "failed");
+    if (started) usleep(8000000);
+    return started;
+  }
+
   bool StartAdvertisingInternal(const BleAdvertisementData& data,
                                 AdvertiseParameters parameters) {
     if (!BluezConnection::Get()->available()) return false;
@@ -1140,7 +1160,9 @@ class BleMediumImpl final : public api::ble::BleMedium {
     {
       std::lock_guard<std::mutex> lock(advertising_mutex_);
       advertising_data_ = data;
+      saved_advertising_data_ = data;
       advertising_connectable_ = parameters.is_connectable;
+      advertising_parameters_ = parameters;
       advertising_path_ = absl::StrCat(
           "/com/tarbum/quickshare/adv", next_advertisement_id_++);
       advertising_path = advertising_path_;
@@ -1514,6 +1536,8 @@ class BleMediumImpl final : public api::ble::BleMedium {
   guint changed_subscription_ = 0;
   std::mutex advertising_mutex_;
   FastInitAdvertisement fast_init_;
+  AdvertiseParameters advertising_parameters_{TxPowerLevel::kMedium, true};
+  BleAdvertisementData saved_advertising_data_;
   bool advertising_ = false;
   bool advertising_connectable_ = true;
   std::string advertising_path_;
@@ -2716,6 +2740,7 @@ std::unique_ptr<api::ble::BleSocket> BleMediumImpl::Connect(
              BluezConnection::Get()->adapter_path(), kAdapterInterface,
              "StopDiscovery", nullptr);
   usleep(300000);
+  PulseAdvertising();
   auto client = std::make_shared<WeaveGattClient>(address);
   bool connected = client->Connect();
   CallMethod(BluezConnection::Get()->connection(),
