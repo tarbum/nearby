@@ -1897,15 +1897,20 @@ class WeaveGattClient {
         GetBoolProperty(BluezConnection::Get()->connection(), device_path_,
                         "org.bluez.Device1", "Connected")
             .value_or(false);
-    for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+    if (!connected) {
       CallMethod(BluezConnection::Get()->connection(), device_path_,
-                 "org.bluez.Device1", "Connect", nullptr);
-      for (int wait = 0; wait < 10 && !connected; ++wait) {
-        usleep(200000);
-        connected = GetBoolProperty(BluezConnection::Get()->connection(),
-                                    device_path_, "org.bluez.Device1",
-                                    "Connected")
-                        .value_or(false);
+                 "org.bluez.Device1", "Disconnect", nullptr);
+      usleep(300000);
+      for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+        CallMethod(BluezConnection::Get()->connection(), device_path_,
+                   "org.bluez.Device1", "Connect", nullptr);
+        for (int wait = 0; wait < 10 && !connected; ++wait) {
+          usleep(200000);
+          connected = GetBoolProperty(BluezConnection::Get()->connection(),
+                                      device_path_, "org.bluez.Device1",
+                                      "Connected")
+                          .value_or(false);
+        }
       }
     }
     if (!connected) {
@@ -2005,6 +2010,7 @@ class WeaveGattClient {
     g_variant_iter_init(&iter, objects);
     const gchar* path = nullptr;
     GVariant* interfaces = nullptr;
+    std::string connected_weave_path;
     while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
       GVariant* props = g_variant_lookup_value(
           interfaces, "org.bluez.Device1", G_VARIANT_TYPE("a{sv}"));
@@ -2014,15 +2020,42 @@ class WeaveGattClient {
         if (address != nullptr &&
             Lowercase(VariantToString(address)) == Lowercase(address_)) {
           device_path_ = path;
-          g_variant_unref(address);
-          g_variant_unref(props);
-          g_variant_unref(interfaces);
-          break;
         }
         if (address != nullptr) g_variant_unref(address);
+        GVariant* connected = g_variant_lookup_value(
+            props, "Connected", G_VARIANT_TYPE_BOOLEAN);
+        bool is_connected =
+            connected != nullptr && g_variant_get_boolean(connected);
+        if (connected != nullptr) g_variant_unref(connected);
+        if (is_connected && connected_weave_path.empty()) {
+          GVariant* uuids = g_variant_lookup_value(
+              props, "UUIDs", G_VARIANT_TYPE("as"));
+          if (uuids != nullptr) {
+            GVariantIter uuid_iter;
+            const gchar* uuid = nullptr;
+            g_variant_iter_init(&uuid_iter, uuids);
+            while (g_variant_iter_next(&uuid_iter, "&s", &uuid)) {
+              if (Lowercase(uuid) == Lowercase(kWeaveServiceUuid)) {
+                connected_weave_path = path;
+                break;
+              }
+            }
+            g_variant_unref(uuids);
+          }
+        }
         g_variant_unref(props);
       }
       g_variant_unref(interfaces);
+    }
+    if (!device_path_.empty() && !connected_weave_path.empty()) {
+      auto target_connected = GetBoolProperty(
+          BluezConnection::Get()->connection(), device_path_,
+          "org.bluez.Device1", "Connected");
+      if (!target_connected.value_or(false)) {
+        LOG(INFO) << "Using connected BlueZ peer " << connected_weave_path
+                  << " instead of stale advertisement address " << address_;
+        device_path_ = connected_weave_path;
+      }
     }
     g_variant_unref(objects);
     g_variant_unref(reply);
@@ -2043,10 +2076,10 @@ class WeaveGattClient {
     GVariant* objects = nullptr;
     g_variant_get(reply, "(@a{oa{sa{sv}}})", &objects);
     GVariantIter iter;
-    g_variant_iter_init(&iter, objects);
     const gchar* path = nullptr;
     GVariant* interfaces = nullptr;
-    std::string service_path;
+    std::vector<std::string> services;
+    g_variant_iter_init(&iter, objects);
     while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
       GVariant* props = g_variant_lookup_value(
           interfaces, "org.bluez.GattService1", G_VARIANT_TYPE("a{sv}"));
@@ -2055,46 +2088,50 @@ class WeaveGattClient {
             props, "UUID", G_VARIANT_TYPE_STRING);
         if (uuid != nullptr &&
             Lowercase(VariantToString(uuid)) == Lowercase(kWeaveServiceUuid)) {
-          service_path = path;
-          g_variant_unref(uuid);
+          services.push_back(path);
+        }
+        if (uuid != nullptr) g_variant_unref(uuid);
+        g_variant_unref(props);
+      }
+      g_variant_unref(interfaces);
+    }
+    for (const auto& service_path : services) {
+      std::string to_path;
+      std::string from_path;
+      g_variant_iter_init(&iter, objects);
+      while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path,
+                                 &interfaces)) {
+        GVariant* props = g_variant_lookup_value(
+            interfaces, "org.bluez.GattCharacteristic1",
+            G_VARIANT_TYPE("a{sv}"));
+        if (props != nullptr) {
+          GVariant* uuid = g_variant_lookup_value(
+              props, "UUID", G_VARIANT_TYPE_STRING);
+          GVariant* service = g_variant_lookup_value(
+              props, "Service", G_VARIANT_TYPE_OBJECT_PATH);
+          if (uuid != nullptr && service != nullptr &&
+              VariantToString(service) == service_path) {
+            std::string value = Lowercase(VariantToString(uuid));
+            if (value == Lowercase(kWeaveToPeripheralUuid)) to_path = path;
+            if (value == Lowercase(kWeaveFromPeripheralUuid)) from_path = path;
+          }
+          if (uuid != nullptr) g_variant_unref(uuid);
+          if (service != nullptr) g_variant_unref(service);
           g_variant_unref(props);
-          g_variant_unref(interfaces);
-          break;
         }
-        if (uuid != nullptr) g_variant_unref(uuid);
-        g_variant_unref(props);
+        g_variant_unref(interfaces);
       }
-      g_variant_unref(interfaces);
-    }
-    if (service_path.empty()) {
-      g_variant_unref(objects);
-      g_variant_unref(reply);
-      return false;
-    }
-    g_variant_iter_init(&iter, objects);
-    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
-      GVariant* props = g_variant_lookup_value(
-          interfaces, "org.bluez.GattCharacteristic1", G_VARIANT_TYPE("a{sv}"));
-      if (props != nullptr) {
-        GVariant* uuid = g_variant_lookup_value(props, "UUID",
-                                                G_VARIANT_TYPE_STRING);
-        GVariant* service = g_variant_lookup_value(
-            props, "Service", G_VARIANT_TYPE_OBJECT_PATH);
-        if (uuid != nullptr && service != nullptr &&
-            VariantToString(service) == service_path) {
-          std::string value = Lowercase(VariantToString(uuid));
-          if (value == Lowercase(kWeaveToPeripheralUuid)) to_path_ = path;
-          if (value == Lowercase(kWeaveFromPeripheralUuid)) from_path_ = path;
-        }
-        if (uuid != nullptr) g_variant_unref(uuid);
-        if (service != nullptr) g_variant_unref(service);
-        g_variant_unref(props);
+      if (!to_path.empty() && !from_path.empty()) {
+        to_path_ = to_path;
+        from_path_ = from_path;
+        g_variant_unref(objects);
+        g_variant_unref(reply);
+        return true;
       }
-      g_variant_unref(interfaces);
     }
     g_variant_unref(objects);
     g_variant_unref(reply);
-    return !to_path_.empty() && !from_path_.empty();
+    return false;
   }
 
   std::string address_;
@@ -2657,6 +2694,9 @@ std::unique_ptr<BleL2capSocket> BleMediumImpl::ConnectOverL2cap(
     int psm, const std::string& service_id, TxPowerLevel tx_power_level,
     BlePeripheral::UniqueId peripheral_id,
     CancellationFlag* cancellation_flag) {
+  if (std::getenv("QUICKSHARE_ENABLE_BLE_L2CAP") == nullptr) {
+    return nullptr;
+  }
   if (cancellation_flag != nullptr && cancellation_flag->Cancelled()) {
     return nullptr;
   }
